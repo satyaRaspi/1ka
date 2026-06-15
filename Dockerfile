@@ -14,11 +14,13 @@ ENV PYTHONUNBUFFERED=1 \
     DB_PATH=/app/data/guarantee_portal.db \
     FRONTEND_DIST=/app/frontend/dist
 
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r ./backend/requirements.txt
 COPY backend/ ./backend/
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
+RUN chown -R appuser:appgroup /app
+USER appuser
 
 EXPOSE 8000
 CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

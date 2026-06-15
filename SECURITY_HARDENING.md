@@ -60,3 +60,16 @@ Before real deployment, add:
 - Periodic vulnerability scanning and dependency scanning.
 - Secrets managed through Railway/Cloud secrets only.
 - Department-approved privacy notice, retention policy, and grievance process.
+
+
+## v1.2.5 demo-safe security fixes
+- CSV/Excel formula injection protection.
+- Public statistics suppression applied to all public breakdowns.
+- Production guard for wildcard CORS and demo data tools.
+- FastAPI docs disabled when APP_ENV=production.
+- Disabled users cannot continue using existing sessions.
+- Audit log hash chain added for tamper-evidence.
+- Security alerts recorded for exports, sensitive views and mass proposal apply.
+- Docker runtime now runs as a non-root user.
+- Frontend dependencies are pinned.
+- Server calculates age from DOB and performs cross-application Aadhaar duplicate checks.

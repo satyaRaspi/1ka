@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, Response, FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 import sqlite3
@@ -22,7 +22,15 @@ APP_NAME = "Karnataka Guarantee Schemes Registration Portal"
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "guarantee_portal.db"))
 OTP_DEMO = os.getenv("DEMO_OTP", "123456")
 
-app = FastAPI(title=APP_NAME, version="1.2.3")
+APP_ENV = os.getenv("APP_ENV", "demo").lower()
+IS_PRODUCTION = APP_ENV in ("prod", "production")
+app = FastAPI(
+    title=APP_NAME,
+    version="1.2.5",
+    docs_url=None if IS_PRODUCTION else "/docs",
+    redoc_url=None if IS_PRODUCTION else "/redoc",
+    openapi_url=None if IS_PRODUCTION else "/openapi.json",
+)
 
 # Security-conscious CORS defaults. For Railway/single-domain deployments the frontend is
 # served by FastAPI and same-origin requests do not need wildcard CORS. Use CORS_ORIGINS
@@ -30,6 +38,10 @@ app = FastAPI(title=APP_NAME, version="1.2.3")
 _cors_env = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000")
 _cors_origins = [origin.strip() for origin in _cors_env.split(",") if origin.strip()]
 _allow_all_cors = "*" in _cors_origins
+if IS_PRODUCTION and _allow_all_cors:
+    raise RuntimeError("CORS_ORIGINS='*' is not allowed when APP_ENV=production")
+if IS_PRODUCTION and not _cors_origins:
+    raise RuntimeError("CORS_ORIGINS must list exact trusted domains when APP_ENV=production")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if _allow_all_cors else _cors_origins,
@@ -88,7 +100,7 @@ async def security_middleware(request: Request, call_next):
     response.headers.setdefault("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
     if request.url.path.startswith("/api"):
         response.headers.setdefault("Cache-Control", "no-store")
-    if os.getenv("ENABLE_HSTS", "0") == "1":
+    if os.getenv("ENABLE_HSTS", "1" if IS_PRODUCTION else "0") == "1":
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
 
@@ -209,10 +221,58 @@ def _redact_metadata(metadata: Optional[dict]) -> dict:
     return redacted
 
 def audit(conn, user_id: Optional[int], role: str, action: str, record_type: str = "", record_id: str = "", metadata: Optional[dict] = None):
+    created = now_iso()
+    safe_metadata = json.dumps(_redact_metadata(metadata), sort_keys=True)
+    prev = conn.execute("SELECT entry_hash FROM audit_logs WHERE entry_hash != '' ORDER BY id DESC LIMIT 1").fetchone()
+    prev_hash = prev["entry_hash"] if prev else "GENESIS"
+    body = "|".join([prev_hash, str(user_id or ""), role or "", action or "", record_type or "", str(record_id or ""), safe_metadata, created])
+    entry_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     conn.execute(
-        "INSERT INTO audit_logs(user_id, role, action, record_type, record_id, metadata, created_at) VALUES(?,?,?,?,?,?,?)",
-        (user_id, role, action, record_type, str(record_id or ""), json.dumps(_redact_metadata(metadata)), now_iso()),
+        "INSERT INTO audit_logs(user_id, role, action, record_type, record_id, metadata, created_at, prev_hash, entry_hash) VALUES(?,?,?,?,?,?,?,?,?)",
+        (user_id, role, action, record_type, str(record_id or ""), safe_metadata, created, prev_hash, entry_hash),
     )
+
+def security_alert(conn, severity: str, alert_type: str, message: str, related_record_type: str = "", related_record_id: str = ""):
+    conn.execute(
+        "INSERT INTO security_alerts(severity, alert_type, message, related_record_type, related_record_id, created_at) VALUES(?,?,?,?,?,?)",
+        (severity, alert_type, message[:1000], related_record_type, str(related_record_id or ""), now_iso()),
+    )
+
+def production_guard(feature_name: str):
+    if IS_PRODUCTION and os.getenv(f"ENABLE_{feature_name.upper()}", "0") != "1":
+        raise HTTPException(403, f"{feature_name.replace('_',' ').title()} is disabled in production")
+
+def calculate_age_from_dob(dob: str) -> int:
+    try:
+        born = datetime.fromisoformat(str(dob)[:10])
+        today = datetime.utcnow()
+        return max(0, today.year - born.year - ((today.month, today.day) < (born.month, born.day)))
+    except Exception:
+        return 0
+
+def clean_text(value: Any, max_len: int = 250) -> str:
+    return str(value or "").strip()[:max_len]
+
+def escape_spreadsheet_value(value: Any) -> str:
+    text = "" if value is None else str(value)
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r", "\n"):
+        return "'" + text
+    return text
+
+def mask_report_rows(rows: List[dict]) -> List[dict]:
+    protected = []
+    for row in rows:
+        out = dict(row)
+        for key in list(out.keys()):
+            lk = key.lower()
+            if "aadhaar" in lk:
+                out[key] = mask_aadhaar(out[key])
+            elif "account" in lk and "count" not in lk:
+                out[key] = mask_bank(out[key])
+            elif lk in ("mobile", "citizen_mobile", "aadhaar_linked_mobile", "alternate_mobile"):
+                out[key] = mask_mobile(out[key])
+        protected.append(out)
+    return protected
 
 
 def init_db():
@@ -351,6 +411,26 @@ def init_db():
             record_type TEXT,
             record_id TEXT,
             metadata TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS security_alerts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            severity TEXT NOT NULL,
+            alert_type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            related_record_type TEXT DEFAULT '',
+            related_record_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'Open',
+            created_at TEXT NOT NULL,
+            closed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS retention_actions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_type TEXT NOT NULL,
+            data_category TEXT NOT NULL,
+            status TEXT DEFAULT 'Logged',
+            details TEXT DEFAULT '',
+            created_by TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS privacy_requests(
@@ -500,6 +580,18 @@ def migrate_schema(conn):
         conn.execute("ALTER TABLE scheme_selections ADD COLUMN approved_at TEXT")
     if not column_exists(conn, "applications", "demo_batch_id"):
         conn.execute("ALTER TABLE applications ADD COLUMN demo_batch_id TEXT DEFAULT ''")
+    if not column_exists(conn, "audit_logs", "prev_hash"):
+        conn.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT DEFAULT ''")
+    if not column_exists(conn, "audit_logs", "entry_hash"):
+        conn.execute("ALTER TABLE audit_logs ADD COLUMN entry_hash TEXT DEFAULT ''")
+    if not column_exists(conn, "approval_proposals", "review_status"):
+        conn.execute("ALTER TABLE approval_proposals ADD COLUMN review_status TEXT DEFAULT 'Draft'")
+    if not column_exists(conn, "approval_proposals", "review_requested_by"):
+        conn.execute("ALTER TABLE approval_proposals ADD COLUMN review_requested_by TEXT DEFAULT ''")
+    if not column_exists(conn, "approval_proposals", "review_requested_at"):
+        conn.execute("ALTER TABLE approval_proposals ADD COLUMN review_requested_at TEXT")
+    if not column_exists(conn, "approval_proposals", "apply_reason"):
+        conn.execute("ALTER TABLE approval_proposals ADD COLUMN apply_reason TEXT DEFAULT ''")
     # Convert earlier prototype state to the revised business terminology.
     conn.execute("UPDATE applications SET status='Registered', aadhaar_verification_status='Pending Batch Verification' WHERE status='Submitted'")
 
@@ -619,7 +711,7 @@ def on_startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": APP_NAME, "version": "1.2.3", "security": "hardened"}
+    return {"status": "ok", "app": APP_NAME, "version": "1.2.5", "security": "hardened"}
 
 # -----------------------------
 # Models
@@ -697,25 +789,25 @@ class SchemeSelection(BaseModel):
 
 class StatusUpdate(BaseModel):
     status: str
-    remarks: str = ""
+    remarks: str = Field("", max_length=500)
 
 class SchemeStatusUpdate(BaseModel):
-    eligibility_status: str = "Eligibility Under Review"
-    approval_status: str = "Pending Scheme Approval"
-    eligibility_reason: str = ""
+    eligibility_status: str = Field("Eligibility Under Review", max_length=80)
+    approval_status: str = Field("Pending Scheme Approval", max_length=80)
+    eligibility_reason: str = Field("", max_length=1000)
 
 class CommentCreate(BaseModel):
-    comment_text: str
+    comment_text: str = Field(..., min_length=1, max_length=1000)
 
 class PrivacyRequestCreate(BaseModel):
     application_id: int
-    request_type: str
-    description: str
+    request_type: str = Field(..., max_length=80)
+    description: str = Field(..., min_length=5, max_length=2000)
 
 class GrievanceCreate(BaseModel):
     application_id: int
-    category: str
-    description: str
+    category: str = Field(..., max_length=80)
+    description: str = Field(..., min_length=5, max_length=2000)
 
 class ElectricityUsageCreate(BaseModel):
     consumer_no: str
@@ -734,9 +826,18 @@ class MassUploadPayload(BaseModel):
     rows: List[Dict[str, Any]] = []
 
 class DemoDataRequest(BaseModel):
-    count: int = 100
+    count: int = Field(100, ge=1, le=500)
     clear_existing_demo: bool = False
     include_reference_data: bool = True
+
+class ApprovalApplyRequest(BaseModel):
+    confirm_text: str = Field("", max_length=40)
+    reason: str = Field("", min_length=10, max_length=1000)
+
+class ResolutionUpdate(BaseModel):
+    status: str = Field(..., max_length=50)
+    assigned_officer: str = Field("", max_length=120)
+    resolution_remarks: str = Field("", max_length=2000)
 
 # -----------------------------
 # Auth
@@ -779,6 +880,10 @@ def require_auth(authorization: Optional[str] = Header(None)):
     user = None
     if sess["user_id"]:
         user = conn.execute("SELECT * FROM users WHERE id=?", (sess["user_id"],)).fetchone()
+        if not user or int(user["active"] or 0) != 1:
+            conn.execute("DELETE FROM sessions WHERE token=?", (token_hash,))
+            conn.commit(); conn.close()
+            raise HTTPException(401, "User account is inactive")
     principal = {"token": token, "user_id": sess["user_id"], "role": sess["role"], "mobile": sess["mobile"], "username": user["username"] if user else sess["mobile"], "name": user["name"] if user else "Citizen"}
     conn.close()
     return principal
@@ -863,11 +968,22 @@ def public_stats(district: str = "", scheme: str = ""):
         params.append(scheme)
     sql_where = " WHERE " + " AND ".join(where) if where else ""
     totals = conn.execute(f"SELECT COUNT(*) c, SUM(CASE WHEN status='Approved' THEN 1 ELSE 0 END) approved, SUM(CASE WHEN status='Registered' THEN 1 ELSE 0 END) registered, SUM(CASE WHEN status='Under Review' THEN 1 ELSE 0 END) under_review, SUM(CASE WHEN status='Rejected' THEN 1 ELSE 0 END) rejected FROM applications a {sql_where}", params).fetchone()
-    by_scheme = [dict(r) for r in conn.execute("SELECT scheme_name AS label, COUNT(*) AS value FROM scheme_selections GROUP BY scheme_name ORDER BY value DESC").fetchall()]
-    by_district = [dict(r) for r in conn.execute("SELECT district AS label, COUNT(*) AS value FROM addresses GROUP BY district ORDER BY value DESC").fetchall()]
-    by_status = [dict(r) for r in conn.execute("SELECT status AS label, COUNT(*) AS value FROM applications GROUP BY status").fetchall()]
-    by_gender = [dict(r) for r in conn.execute("SELECT gender AS label, COUNT(*) AS value FROM applications GROUP BY gender").fetchall()]
-    trend = [dict(r) for r in conn.execute("SELECT substr(created_at,1,10) AS label, COUNT(*) AS value FROM applications GROUP BY substr(created_at,1,10) ORDER BY label").fetchall()]
+
+    by_scheme = [dict(r) for r in conn.execute(f"""
+        SELECT ss.scheme_name AS label, COUNT(*) AS value
+        FROM scheme_selections ss JOIN applications a ON a.id=ss.application_id
+        {sql_where}
+        GROUP BY ss.scheme_name ORDER BY value DESC
+    """, params).fetchall()]
+    by_district = [dict(r) for r in conn.execute(f"""
+        SELECT ad.district AS label, COUNT(*) AS value
+        FROM addresses ad JOIN applications a ON a.id=ad.application_id
+        {sql_where}
+        GROUP BY ad.district ORDER BY value DESC
+    """, params).fetchall()]
+    by_status = [dict(r) for r in conn.execute(f"SELECT a.status AS label, COUNT(*) AS value FROM applications a {sql_where} GROUP BY a.status", params).fetchall()]
+    by_gender = [dict(r) for r in conn.execute(f"SELECT a.gender AS label, COUNT(*) AS value FROM applications a {sql_where} GROUP BY a.gender", params).fetchall()]
+    trend = [dict(r) for r in conn.execute(f"SELECT substr(a.created_at,1,10) AS label, COUNT(*) AS value FROM applications a {sql_where} GROUP BY substr(a.created_at,1,10) ORDER BY label", params).fetchall()]
     conn.close()
     return {
         "last_updated": now_iso(),
@@ -881,11 +997,10 @@ def public_stats(district: str = "", scheme: str = ""):
         },
         "scheme_wise": suppress_small_counts(by_scheme),
         "district_wise": suppress_small_counts(by_district),
-        "status": by_status,
-        "gender": by_gender,
-        "trend": trend,
+        "status": suppress_small_counts(by_status),
+        "gender": suppress_small_counts(by_gender),
+        "trend": suppress_small_counts(trend),
     }
-
 
 def suppress_small_counts(rows, threshold: int = int(os.getenv("PUBLIC_STATS_MIN_CELL_SIZE", "5"))):
     # Privacy-preserving default. Set PUBLIC_STATS_MIN_CELL_SIZE for your deployment.
@@ -966,8 +1081,10 @@ def create_my_application(user=Depends(require_role("citizen"))):
 def get_citizen_app_or_404(conn, mobile):
     app_row = conn.execute("SELECT * FROM applications WHERE citizen_mobile=? ORDER BY id DESC LIMIT 1", (mobile,)).fetchone()
     if not app_row:
+        conn.close()
         raise HTTPException(404, "Application not found. Create an application first.")
     if app_row["status"] not in ("Draft", "Returned for Correction"):
+        conn.close()
         raise HTTPException(400, "Application can be edited only in Draft or Returned for Correction status")
     return app_row
 
@@ -981,6 +1098,20 @@ def validate_aadhaar(value: str, label: str = "Aadhaar"):
     if value and (not value.isdigit() or len(value) != 12):
         raise HTTPException(400, f"{label} must be 12 digits")
 
+def ensure_aadhaar_not_used_elsewhere(conn, aadhaar: str, current_application_id: int, current_family_member_id: Optional[int] = None):
+    if not aadhaar:
+        return
+    app_dup = conn.execute("SELECT application_no FROM applications WHERE aadhaar=? AND id != ? LIMIT 1", (aadhaar, current_application_id)).fetchone()
+    fam_params = [aadhaar, current_application_id]
+    fam_sql = "SELECT id FROM family_members WHERE aadhaar=? AND application_id != ?"
+    if current_family_member_id:
+        fam_sql += " AND id != ?"
+        fam_params.append(current_family_member_id)
+    fam_sql += " LIMIT 1"
+    fam_dup = conn.execute(fam_sql, tuple(fam_params)).fetchone()
+    if app_dup or fam_dup:
+        raise HTTPException(400, "Aadhaar is already linked to another application record")
+
 def validate_email(value: str):
     if value and "@" not in value:
         raise HTTPException(400, "Email must contain @")
@@ -991,8 +1122,6 @@ def validate_dropdown(value: str, allowed: list, label: str):
 
 @app.put("/api/citizen/application/applicant")
 def update_applicant(payload: ApplicantUpdate, user=Depends(require_role("citizen"))):
-    conn = get_conn()
-    app_row = get_citizen_app_or_404(conn, user["mobile"])
     validate_aadhaar(payload.aadhaar, "Aadhaar")
     validate_mobile(payload.mobile, "Mobile number")
     validate_mobile(payload.alternate_mobile, "Alternate mobile number")
@@ -1000,9 +1129,13 @@ def update_applicant(payload: ApplicantUpdate, user=Depends(require_role("citize
     validate_email(payload.email)
     validate_dropdown(payload.gender, GENDERS, "gender")
     validate_dropdown(payload.marital_status, MARITAL_STATUSES, "marital status")
+    conn = get_conn()
+    app_row = get_citizen_app_or_404(conn, user["mobile"])
+    ensure_aadhaar_not_used_elsewhere(conn, payload.aadhaar, app_row["id"])
     if payload.account_number == "":
         pass
     fields = payload.dict()
+    fields["age"] = calculate_age_from_dob(fields.get("dob"))
     fields["updated_at"] = now_iso()
     sets = ",".join([f"{k}=?" for k in fields])
     conn.execute(f"UPDATE applications SET {sets} WHERE id=?", list(fields.values()) + [app_row["id"]])
@@ -1012,12 +1145,12 @@ def update_applicant(payload: ApplicantUpdate, user=Depends(require_role("citize
 
 @app.put("/api/citizen/application/address")
 def update_address(payload: AddressUpdate, user=Depends(require_role("citizen"))):
-    conn = get_conn()
-    app_row = get_citizen_app_or_404(conn, user["mobile"])
     if payload.pincode and (not payload.pincode.isdigit() or len(payload.pincode) != 6):
         raise HTTPException(400, "PIN code must be 6 digits")
     validate_dropdown(payload.district, DISTRICTS, "district")
     validate_dropdown(payload.state or "Karnataka", STATES, "state")
+    conn = get_conn()
+    app_row = get_citizen_app_or_404(conn, user["mobile"])
     existing = conn.execute("SELECT id FROM addresses WHERE application_id=?", (app_row["id"],)).fetchone()
     d = payload.dict(); d["updated_at"] = now_iso()
     if existing:
@@ -1033,17 +1166,19 @@ def update_address(payload: AddressUpdate, user=Depends(require_role("citizen"))
 
 @app.post("/api/citizen/application/family")
 def add_family(payload: FamilyMember, user=Depends(require_role("citizen"))):
-    conn = get_conn()
-    app_row = get_citizen_app_or_404(conn, user["mobile"])
     validate_aadhaar(payload.aadhaar, "Family member Aadhaar")
     validate_mobile(payload.mobile, "Family member mobile")
     validate_dropdown(payload.gender, GENDERS, "family member gender")
     validate_dropdown(payload.marital_status, MARITAL_STATUSES, "family member marital status")
+    conn = get_conn()
+    app_row = get_citizen_app_or_404(conn, user["mobile"])
+    ensure_aadhaar_not_used_elsewhere(conn, payload.aadhaar, app_row["id"])
     if payload.aadhaar:
         duplicate = conn.execute("SELECT id FROM family_members WHERE application_id=? AND aadhaar=?", (app_row["id"], payload.aadhaar)).fetchone()
         if duplicate or app_row["aadhaar"] == payload.aadhaar:
+            conn.close()
             raise HTTPException(400, "Duplicate Aadhaar within application is not allowed")
-    d = payload.dict(); d["application_id"] = app_row["id"]; d["created_at"] = now_iso(); d["updated_at"] = now_iso()
+    d = payload.dict(); d["age"] = calculate_age_from_dob(d.get("dob")); d["is_minor"] = 1 if d.get("age", 0) < 18 else int(d.get("is_minor") or 0); d["application_id"] = app_row["id"]; d["created_at"] = now_iso(); d["updated_at"] = now_iso()
     cols = ",".join(d.keys()); qs = ",".join(["?"] * len(d))
     cur = conn.execute(f"INSERT INTO family_members({cols}) VALUES({qs})", list(d.values()))
     audit(conn, None, "citizen", "family_add", "family_member", cur.lastrowid)
@@ -1052,16 +1187,18 @@ def add_family(payload: FamilyMember, user=Depends(require_role("citizen"))):
 
 @app.put("/api/citizen/application/family/{member_id}")
 def edit_family(member_id: int, payload: FamilyMember, user=Depends(require_role("citizen"))):
-    conn = get_conn()
-    app_row = get_citizen_app_or_404(conn, user["mobile"])
-    exists = conn.execute("SELECT id FROM family_members WHERE id=? AND application_id=?", (member_id, app_row["id"])).fetchone()
-    if not exists:
-        raise HTTPException(404, "Family member not found")
     validate_aadhaar(payload.aadhaar, "Family member Aadhaar")
     validate_mobile(payload.mobile, "Family member mobile")
     validate_dropdown(payload.gender, GENDERS, "family member gender")
     validate_dropdown(payload.marital_status, MARITAL_STATUSES, "family member marital status")
-    d = payload.dict(); d["updated_at"] = now_iso()
+    conn = get_conn()
+    app_row = get_citizen_app_or_404(conn, user["mobile"])
+    exists = conn.execute("SELECT id FROM family_members WHERE id=? AND application_id=?", (member_id, app_row["id"])).fetchone()
+    if not exists:
+        conn.close()
+        raise HTTPException(404, "Family member not found")
+    ensure_aadhaar_not_used_elsewhere(conn, payload.aadhaar, app_row["id"], member_id)
+    d = payload.dict(); d["age"] = calculate_age_from_dob(d.get("dob")); d["is_minor"] = 1 if d.get("age", 0) < 18 else int(d.get("is_minor") or 0); d["updated_at"] = now_iso()
     sets = ",".join([f"{k}=?" for k in d])
     conn.execute(f"UPDATE family_members SET {sets} WHERE id=?", list(d.values()) + [member_id])
     audit(conn, None, "citizen", "family_edit", "family_member", member_id)
@@ -1079,12 +1216,13 @@ def delete_family(member_id: int, user=Depends(require_role("citizen"))):
 
 @app.put("/api/citizen/application/schemes")
 def save_schemes(payload: SchemeSelection, user=Depends(require_role("citizen"))):
+    for scheme in payload.schemes.keys():
+        if scheme not in SCHEMES:
+            raise HTTPException(400, f"Unknown scheme: {scheme}")
     conn = get_conn()
     app_row = get_citizen_app_or_404(conn, user["mobile"])
     conn.execute("DELETE FROM scheme_selections WHERE application_id=?", (app_row["id"],))
     for scheme, details in payload.schemes.items():
-        if scheme not in SCHEMES:
-            raise HTTPException(400, f"Unknown scheme: {scheme}")
         conn.execute("INSERT INTO scheme_selections(application_id,scheme_name,details_json,created_at,updated_at) VALUES(?,?,?,?,?)", (app_row["id"], scheme, json.dumps(details or {}), now_iso(), now_iso()))
     audit(conn, None, "citizen", "schemes_update", "application", app_row["id"], {"schemes": list(payload.schemes.keys())})
     conn.commit(); conn.close()
@@ -1096,8 +1234,10 @@ def submit_application(user=Depends(require_role("citizen"))):
     app_row = get_citizen_app_or_404(conn, user["mobile"])
     schemes_count = conn.execute("SELECT COUNT(*) c FROM scheme_selections WHERE application_id=?", (app_row["id"],)).fetchone()["c"]
     if not app_row["applicant_name"] or not app_row["aadhaar"]:
+        conn.close()
         raise HTTPException(400, "Applicant name and Aadhaar are required")
     if schemes_count == 0:
+        conn.close()
         raise HTTPException(400, "At least one scheme must be selected")
     prev = app_row["status"]
     ts = now_iso()
@@ -1113,6 +1253,7 @@ def citizen_privacy_request(payload: PrivacyRequestCreate, user=Depends(require_
     conn = get_conn()
     app_row = conn.execute("SELECT * FROM applications WHERE id=? AND citizen_mobile=?", (payload.application_id, user["mobile"])).fetchone()
     if not app_row:
+        conn.close()
         raise HTTPException(404, "Application not found")
     cur = conn.execute("INSERT INTO privacy_requests(application_id,request_type,description,created_at) VALUES(?,?,?,?)", (payload.application_id, payload.request_type, payload.description, now_iso()))
     audit(conn, None, "citizen", "privacy_request_create", "privacy_request", cur.lastrowid)
@@ -1124,6 +1265,7 @@ def citizen_grievance(payload: GrievanceCreate, user=Depends(require_role("citiz
     conn = get_conn()
     app_row = conn.execute("SELECT * FROM applications WHERE id=? AND citizen_mobile=?", (payload.application_id, user["mobile"])).fetchone()
     if not app_row:
+        conn.close()
         raise HTTPException(404, "Application not found")
     cur = conn.execute("INSERT INTO grievances(application_id,category,description,created_at) VALUES(?,?,?,?)", (payload.application_id, payload.category, payload.description, now_iso()))
     audit(conn, None, "citizen", "grievance_create", "grievance", cur.lastrowid)
@@ -1201,16 +1343,19 @@ def get_application_detail(application_id: int, include_sensitive: int = 0, reas
     conn = get_conn()
     row = conn.execute("SELECT * FROM applications WHERE id=?", (application_id,)).fetchone()
     if not row:
+        conn.close()
         raise HTTPException(404, "Application not found")
     can_sensitive = user["role"] == "admin" and include_sensitive == 1
     if include_sensitive and user["role"] != "admin":
+        conn.close()
         raise HTTPException(403, "Call center cannot view sensitive data")
     if can_sensitive:
-        if not reason.strip():
+        if len(reason.strip()) < 15:
             conn.close()
-            raise HTTPException(400, "Reason is required to view sensitive data")
+            raise HTTPException(400, "A meaningful reason of at least 15 characters is required to view sensitive data")
         conn.execute("INSERT INTO sensitive_access_logs(application_id,user_id,role,field_type,reason,created_at) VALUES(?,?,?,?,?,?)", (application_id, user["user_id"], user["role"], "aadhaar_bank", reason[:250], now_iso()))
         audit(conn, user["user_id"], user["role"], "sensitive_data_view", "application", application_id, {"reason": reason})
+        security_alert(conn, "Medium", "sensitive_data_view", f"Sensitive application data viewed by {user['username']}", "application", str(application_id))
         conn.commit()
     appd = serialize_application(conn, row, include_sensitive=can_sensitive)
     conn.close()
@@ -1221,6 +1366,7 @@ def add_comment(application_id: int, payload: CommentCreate, user=Depends(requir
     conn = get_conn()
     exists = conn.execute("SELECT id FROM applications WHERE id=?", (application_id,)).fetchone()
     if not exists:
+        conn.close()
         raise HTTPException(404, "Application not found")
     comment_text = payload.comment_text.strip()[:2000]
     if not comment_text:
@@ -1554,6 +1700,7 @@ def generate_mass_demo_data(conn, count: int, clear_existing_demo: bool, include
 # -----------------------------
 @app.post("/api/admin/demo-data/generate")
 def admin_generate_demo_data(payload: DemoDataRequest, user=Depends(require_role("admin"))):
+    production_guard("demo_tools")
     # Mass demo generation is intentionally serialized because SQLite is a
     # file-based database and only one writer can hold the write lock at a time.
     # This prevents the Windows/local demo from failing with "database is locked"
@@ -1585,6 +1732,7 @@ def admin_generate_demo_data(payload: DemoDataRequest, user=Depends(require_role
 
 @app.get("/api/admin/demo-data/summary")
 def admin_demo_data_summary(user=Depends(require_role("admin"))):
+    production_guard("demo_tools")
     conn = get_conn()
     summary = conn.execute("""
         SELECT COALESCE(demo_batch_id,'') AS batch_id, COUNT(*) AS applications, MIN(created_at) AS first_created, MAX(created_at) AS last_created
@@ -1603,6 +1751,7 @@ def admin_demo_data_summary(user=Depends(require_role("admin"))):
 
 @app.delete("/api/admin/demo-data")
 def admin_clear_demo_data(user=Depends(require_role("admin"))):
+    production_guard("demo_tools")
     if not _DEMO_DATA_LOCK.acquire(blocking=False):
         raise HTTPException(409, "Demo data operation is already running. Please wait and try again.")
     conn = None
@@ -1879,13 +2028,17 @@ def admin_run_approval_proposal_scan(user=Depends(require_role("admin"))):
     return {"message": "Approval proposal scan completed", "proposal_id": proposal_id, "proposal_no": proposal_no, "analytics": analytics}
 
 @app.post("/api/admin/approval-proposals/{proposal_id}/apply")
-def admin_apply_approval_proposal(proposal_id: int, user=Depends(require_role("admin"))):
+def admin_apply_approval_proposal(proposal_id: int, payload: ApprovalApplyRequest, user=Depends(require_role("admin"))):
     conn = get_conn(); ts = now_iso()
     proposal = conn.execute("SELECT * FROM approval_proposals WHERE id=?", (proposal_id,)).fetchone()
     if not proposal:
         conn.close(); raise HTTPException(404, "Proposal not found")
     if proposal["status"] == "Applied":
         conn.close(); raise HTTPException(400, "Proposal has already been applied")
+    if payload.confirm_text.strip().upper() != "APPLY":
+        conn.close(); raise HTTPException(400, "Type APPLY to confirm proposal application")
+    if len(payload.reason.strip()) < 10:
+        conn.close(); raise HTTPException(400, "A meaningful approval reason is required")
     items = conn.execute("SELECT * FROM approval_proposal_items WHERE proposal_id=?", (proposal_id,)).fetchall()
     affected_apps = set(); applied = 0
     for item in items:
@@ -1895,8 +2048,9 @@ def admin_apply_approval_proposal(proposal_id: int, user=Depends(require_role("a
         affected_apps.add(item["application_id"]); applied += 1
     for application_id in affected_apps:
         update_overall_status_after_scheme_decisions(conn, application_id, user["username"], ts)
-    conn.execute("UPDATE approval_proposals SET status='Applied', applied_by=?, applied_at=? WHERE id=?", (user["username"], ts, proposal_id))
-    audit(conn, user["user_id"], "admin", "approval_proposal_apply", "approval_proposal", proposal_id, {"items_applied": applied, "applications": len(affected_apps)})
+    conn.execute("UPDATE approval_proposals SET status='Applied', applied_by=?, applied_at=?, apply_reason=? WHERE id=?", (user["username"], ts, payload.reason.strip(), proposal_id))
+    audit(conn, user["user_id"], "admin", "approval_proposal_apply", "approval_proposal", proposal_id, {"items_applied": applied, "applications": len(affected_apps), "reason": payload.reason.strip()})
+    security_alert(conn, "High", "approval_proposal_applied", f"Approval proposal {proposal_id} applied by {user['username']} for {applied} scheme records", "approval_proposal", str(proposal_id))
     conn.commit(); conn.close()
     return {"message": "Approval proposal applied", "items_applied": applied, "applications_updated": len(affected_apps)}
 
@@ -1929,7 +2083,7 @@ def admin_update_scheme_status(application_id: int, scheme_name: str, payload: S
     return {"message": "Scheme status updated", "scheme": scheme_name, "eligibility_status": payload.eligibility_status, "approval_status": payload.approval_status}
 
 @app.get("/api/admin/reports/{report_name}")
-def admin_report(report_name: str, fmt: str = Query("json", regex="^(json|csv|excel|pdf)$"), user=Depends(require_role("admin"))):
+def admin_report(report_name: str, fmt: str = Query("json", pattern="^(json|csv|excel|pdf)$"), purpose: str = Query("demo_reporting", max_length=200), user=Depends(require_role("admin"))):
     conn = get_conn()
     rows = [dict(r) for r in conn.execute("""SELECT a.application_no, a.applicant_name, a.gender, a.mobile, a.status, a.created_at, ad.district, ad.taluk,
         GROUP_CONCAT(ss.scheme_name, ', ') AS schemes
@@ -1937,9 +2091,10 @@ def admin_report(report_name: str, fmt: str = Query("json", regex="^(json|csv|ex
         LEFT JOIN addresses ad ON ad.application_id=a.id
         LEFT JOIN scheme_selections ss ON ss.application_id=a.id
         GROUP BY a.id ORDER BY a.created_at DESC""").fetchall()]
-    for r in rows:
-        r["mobile"] = mask_mobile(r.get("mobile"))
-    audit(conn, user["user_id"], "admin", "report_generate", "report", report_name, {"format": fmt})
+    rows = mask_report_rows(rows)
+    if fmt in ("csv", "excel", "pdf"):
+        security_alert(conn, "Medium", "report_export", f"Report {report_name} exported as {fmt} by {user['username']}", "report", report_name)
+    audit(conn, user["user_id"], "admin", "report_generate", "report", report_name, {"format": fmt, "purpose": purpose})
     conn.commit(); conn.close()
     title = report_name.replace("-", " ").title()
     if fmt == "json":
@@ -2015,6 +2170,47 @@ def list_grievances(user=Depends(require_role("admin"))):
     conn.close()
     return {"grievances": rows}
 
+@app.put("/api/admin/privacy-requests/{request_id}")
+def update_privacy_request(request_id: int, payload: ResolutionUpdate, user=Depends(require_role("admin"))):
+    conn = get_conn(); ts = now_iso()
+    row = conn.execute("SELECT * FROM privacy_requests WHERE id=?", (request_id,)).fetchone()
+    if not row:
+        conn.close(); raise HTTPException(404, "Privacy request not found")
+    closed_at = ts if payload.status in ("Closed", "Resolved", "Rejected") else None
+    conn.execute("UPDATE privacy_requests SET status=?, assigned_officer=?, resolution_remarks=?, closed_at=? WHERE id=?", (payload.status, payload.assigned_officer, payload.resolution_remarks, closed_at, request_id))
+    audit(conn, user["user_id"], "admin", "privacy_request_update", "privacy_request", request_id, {"status": payload.status})
+    conn.commit(); conn.close()
+    return {"message": "Privacy request updated", "status": payload.status}
+
+@app.put("/api/admin/grievances/{grievance_id}")
+def update_grievance(grievance_id: int, payload: ResolutionUpdate, user=Depends(require_role("admin"))):
+    conn = get_conn(); ts = now_iso()
+    row = conn.execute("SELECT * FROM grievances WHERE id=?", (grievance_id,)).fetchone()
+    if not row:
+        conn.close(); raise HTTPException(404, "Grievance not found")
+    closed_at = ts if payload.status in ("Closed", "Resolved", "Rejected") else None
+    conn.execute("UPDATE grievances SET status=?, assigned_officer=?, resolution_remarks=?, closed_at=? WHERE id=?", (payload.status, payload.assigned_officer, payload.resolution_remarks, closed_at, grievance_id))
+    audit(conn, user["user_id"], "admin", "grievance_update", "grievance", grievance_id, {"status": payload.status})
+    conn.commit(); conn.close()
+    return {"message": "Grievance updated", "status": payload.status}
+
+@app.get("/api/admin/security-alerts")
+def list_security_alerts(user=Depends(require_role("admin"))):
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM security_alerts ORDER BY created_at DESC LIMIT 200").fetchall()]
+    conn.close()
+    return {"security_alerts": rows}
+
+@app.post("/api/admin/retention/run")
+def run_retention_review(user=Depends(require_role("admin"))):
+    conn = get_conn(); ts = now_iso()
+    # Demo-safe retention review: logs what would be reviewed without deleting citizen data.
+    categories = [dict(r) for r in conn.execute("SELECT data_category, retention_period FROM retention_policy ORDER BY data_category").fetchall()]
+    conn.execute("INSERT INTO retention_actions(action_type,data_category,status,details,created_by,created_at) VALUES(?,?,?,?,?,?)", ("review", "all", "Logged", json.dumps(categories), user["username"], ts))
+    audit(conn, user["user_id"], "admin", "retention_review_run", "retention", "all", {"categories": len(categories)})
+    conn.commit(); conn.close()
+    return {"message": "Retention review logged", "categories_reviewed": len(categories)}
+
 @app.get("/api/admin/master-data")
 def master_data(user=Depends(require_role("admin"))):
     conn = get_conn()
@@ -2030,7 +2226,7 @@ def export_csv(rows, filename):
     stream = io.StringIO()
     if rows:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
-        writer.writeheader(); writer.writerows(rows)
+        writer.writeheader(); writer.writerows([{k: escape_spreadsheet_value(v) for k, v in row.items()} for row in rows])
     else:
         stream.write("No data\n")
     return Response(stream.getvalue(), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
@@ -2047,7 +2243,7 @@ def export_excel(rows, filename):
             letters = chr(65 + rem) + letters
         return f"{letters}{row_idx}"
     def make_cell(value, col_idx, row_idx):
-        value = "" if value is None else str(value)
+        value = escape_spreadsheet_value(value)
         return f'<c r="{cell_ref(col_idx, row_idx)}" t="inlineStr"><is><t>{html.escape(value)}</t></is></c>'
     rows_xml = []
     rows_xml.append('<row r="1">' + ''.join(make_cell(h, i+1, 1) for i, h in enumerate(headers)) + '</row>')
@@ -2072,7 +2268,7 @@ def export_pdf_text(title, rows, filename):
     # Lightweight text export named .txt for environments without reportlab.
     lines = [title, f"Generated at: {now_iso()}", ""]
     for row in rows:
-        lines.append(" | ".join([f"{k}: {v}" for k, v in row.items()]))
+        lines.append(" | ".join([f"{k}: {escape_spreadsheet_value(v)}" for k, v in row.items()]))
     return Response("\n".join(lines), media_type="text/plain", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 # -----------------------------

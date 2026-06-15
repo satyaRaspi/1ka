@@ -1,4 +1,4 @@
-# Karnataka Guarantee Schemes Registration Portal v1.2.3
+# Karnataka Guarantee Schemes Registration Portal v1.2.5
 
 A full-stack working prototype for the Government of Karnataka 5 Guarantee Schemes registration portal.
 
@@ -121,7 +121,7 @@ http://localhost:5173
 ```
 
 
-## Workflow added in v1.2.1
+## Workflow added in v1.2.5
 
 1. Citizen completes the form and clicks **Register Application**.
 2. Application status becomes **Registered**.
@@ -131,7 +131,7 @@ http://localhost:5173
 6. Citizen opens **View Status & Eligibility** to see the current application status, Aadhaar batch verification status, and scheme-wise eligibility/approval.
 
 
-## Approval Proposal Scan added in v1.2.1
+## Approval Proposal Scan added in v1.2.5
 
 The admin module includes **Approval Proposal Scan**.
 
@@ -292,7 +292,7 @@ All dashboard/statistic/report tiles are now clickable. Admin dashboard tiles na
 
 See `SECURITY_HARDENING.md` for Railway variables and production hardening notes.
 
-## v1.2.3 Update — Mass Test Demo Data
+## v1.2.5 Update — Mass Test Demo Data
 
 Admin now has a **Demo Data** module for creating mass test data with varied use cases.
 
@@ -320,7 +320,7 @@ API endpoints added:
 - `GET /api/admin/demo-data/summary`
 - `DELETE /api/admin/demo-data`
 
-## v1.2.3 Update — SQLite Demo Data Lock Fix
+## v1.2.5 Update — SQLite Demo Data Lock Fix
 
 This build fixes local Windows/Mac `sqlite3.OperationalError: database is locked` errors that could occur while generating large demo datasets.
 
