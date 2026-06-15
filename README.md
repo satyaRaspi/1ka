@@ -1,4 +1,4 @@
-# Karnataka Guarantee Schemes Registration Portal v1.1.1
+# Karnataka Guarantee Schemes Registration Portal v1.1.2
 
 A full-stack working prototype for the Government of Karnataka 5 Guarantee Schemes registration portal.
 
@@ -117,7 +117,7 @@ http://localhost:5173
 ```
 
 
-## Workflow added in v1.1.1
+## Workflow added in v1.1.2
 
 1. Citizen completes the form and clicks **Register Application**.
 2. Application status becomes **Registered**.
@@ -162,7 +162,7 @@ http://localhost:5173/public/enrollment-statistics
 - Aadhaar Data Vault integration is not implemented; the requirement is represented as production-readiness guidance.
 - OTP is simulated using fixed demo OTP `123456`.
 - PDF export is implemented as a lightweight text-based export in this prototype. It can be upgraded to ReportLab or WeasyPrint for production-grade PDF.
-- Excel export is dependency-free in v1.1.1, so `openpyxl` is no longer required.
+- Excel export is dependency-free in v1.1.2, so `openpyxl` is no longer required.
 - SQLite is used for local prototype persistence.
 - Increase public-statistics small-count suppression threshold before production deployment.
 
@@ -182,7 +182,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 
 
-## v1.1.1 Update
+## v1.1.2 Update
 - Gender fields are dropdowns.
 - Date of Birth uses date picker.
 - Age is auto-calculated from DOB and read-only.
@@ -190,3 +190,38 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - Email validates for @ symbol.
 - Marital status is a dropdown.
 - District and State are dropdowns, with State defaulting to Karnataka.
+
+
+## Railway Deployment
+
+This package is Railway-ready as a single deployable service. Railway will use the root `Dockerfile` to build the React frontend and run the FastAPI backend. The backend serves the built frontend, so only one Railway service is required.
+
+Files added for Railway:
+
+- `Dockerfile`
+- `railway.json`
+- `.dockerignore`
+- `Procfile` fallback
+- `RAILWAY_DEPLOYMENT.md`
+
+Recommended Railway variables:
+
+```text
+DEMO_OTP=123456
+PASSWORD_SALT=change-this-in-railway
+CORS_ORIGINS=*
+DB_PATH=/app/data/guarantee_portal.db
+```
+
+For SQLite persistence, create a Railway Volume and mount it at `/app/data`.
+
+Railway healthcheck path:
+
+```text
+/health
+```
+
+The app must listen on the Railway-provided `$PORT`; this build does that through the Dockerfile command.
+
+
+Note: `frontend/package-lock.json` is intentionally not included in the Railway-ready package so Railway installs frontend packages from the public npm registry instead of using a local/generated lockfile.

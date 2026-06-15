@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse, Response, FileResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -18,7 +19,7 @@ APP_NAME = "Karnataka Guarantee Schemes Registration Portal"
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "guarantee_portal.db"))
 OTP_DEMO = os.getenv("DEMO_OTP", "123456")
 
-app = FastAPI(title=APP_NAME, version="1.1.1")
+app = FastAPI(title=APP_NAME, version="1.1.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
@@ -431,6 +432,11 @@ def seed_data(conn):
 @app.on_event("startup")
 def on_startup():
     init_db()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "app": APP_NAME, "version": "1.1.2"}
 
 # -----------------------------
 # Models
@@ -1191,6 +1197,34 @@ def export_pdf_text(title, rows, filename):
     for row in rows:
         lines.append(" | ".join([f"{k}: {v}" for k, v in row.items()]))
     return Response("\n".join(lines), media_type="text/plain", headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+# -----------------------------
+# Railway / production frontend serving
+# -----------------------------
+FRONTEND_DIST = os.getenv("FRONTEND_DIST", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")))
+FRONTEND_INDEX = os.path.join(FRONTEND_DIST, "index.html")
+FRONTEND_ASSETS = os.path.join(FRONTEND_DIST, "assets")
+
+if os.path.isdir(FRONTEND_ASSETS):
+    app.mount("/assets", StaticFiles(directory=FRONTEND_ASSETS), name="frontend-assets")
+
+
+@app.get("/")
+def serve_frontend_root():
+    if os.path.exists(FRONTEND_INDEX):
+        return FileResponse(FRONTEND_INDEX)
+    return {"message": APP_NAME, "version": "1.1.2", "api_docs": "/docs", "health": "/health"}
+
+
+@app.get("/{full_path:path}")
+def serve_frontend_routes(full_path: str):
+    # Keep unknown API paths as API 404s; serve React for normal browser routes.
+    if full_path.startswith("api/") or full_path in {"docs", "redoc", "openapi.json", "health"}:
+        raise HTTPException(status_code=404, detail="Not found")
+    if os.path.exists(FRONTEND_INDEX):
+        return FileResponse(FRONTEND_INDEX)
+    return {"message": APP_NAME, "version": "1.1.2", "api_docs": "/docs", "health": "/health"}
+
 
 if __name__ == "__main__":
     import uvicorn
