@@ -1,0 +1,27 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/*.pyc
+backend/.pytest_cache/
+
+# Database files
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Environment files
+.env
+backend/.env
+frontend/.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
