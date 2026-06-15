@@ -59,3 +59,49 @@ label{display:flex;flex-direction:column;gap:7px;font-weight:700;font-size:.9rem
 .schemeStatusGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.schemeStatusCard{background:#fff;border:1px solid var(--border);border-radius:18px;padding:14px;box-shadow:0 10px 25px rgba(15,23,42,.06)}.schemeStatusCard.citizen{background:linear-gradient(180deg,#fff,#f8fafc)}.schemeStatusHead{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.schemeStatusHead h3{margin:0;color:var(--blue);font-size:1rem}.approvalBadge{display:inline-flex;border-radius:999px;background:#eef2ff;color:#1d4ed8;padding:6px 9px;font-weight:900;font-size:.72rem;white-space:nowrap}.approvalBadge.approved{background:#dcfce7;color:#166534}.approvalBadge.rejected{background:#fee2e2;color:#991b1b}.approvalBadge.on-hold{background:#fef3c7;color:#92400e}.approvalBadge.pending-scheme-approval{background:#e0f2fe;color:#075985}.schemeAdminControls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.schemeAdminControls input{grid-column:1 / -1}.schemeAdminControls button{grid-column:1 / -1}.statusPage h3{color:var(--blue);margin-top:18px}
 @media(max-width:1023px){.publicHeroBody{grid-template-columns:1fr}.filterPanel{grid-template-columns:1fr 1fr}.kpiRibbon{grid-template-columns:repeat(2,1fr)}.publicDashboardGrid,.schemeStatusGrid{grid-template-columns:1fr}.stageTimeline{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:767px){.publicHero{padding:16px}.publicHero nav{align-items:flex-start}.publicHero nav a{margin-left:0}.publicHeroBody{margin-top:28px}.heroStat strong{font-size:3rem}.filterPanel,.kpiRibbon,.statusHero,.stageTimeline,.schemeAdminControls{grid-template-columns:1fr}.publicModern{padding:14px}.publicHero nav{flex-wrap:wrap}}
+
+/* v1.1.4 — bilingual Kannada / English support */
+.languageToggle{display:inline-flex;align-items:center;gap:6px;background:#f8fafc;border:1px solid var(--border);border-radius:999px;padding:4px;color:var(--blue);font-weight:900;font-size:.78rem;white-space:nowrap}
+.languageToggle span{padding:0 4px;color:var(--muted)}
+.languageToggle button{padding:7px 10px;border-radius:999px;background:transparent;color:var(--blue);font-size:.78rem}
+.languageToggle button.active{background:var(--blue);color:white}
+
+.loginLanguageBar{max-width:1180px;margin:0 auto 18px;display:flex;align-items:center;justify-content:space-between;gap:14px;background:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.7);box-shadow:0 14px 35px rgba(15,23,42,.10);border-radius:22px;padding:12px 16px;color:var(--blue)}
+.loginLanguageBar div:first-child{display:flex;flex-direction:column;gap:3px}.loginLanguageBar strong{font-size:.95rem}.loginLanguageBar span{font-size:.82rem;color:var(--muted);font-weight:800}
+html[lang="kn"] body{font-family:'Noto Sans Kannada','Nirmala UI','Tunga',Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+html[lang="kn"] .hero h1,html[lang="kn"] .publicHeroBody h2{letter-spacing:-.02em;line-height:1.16}
+html[lang="kn"] button,html[lang="kn"] .buttonLike,html[lang="kn"] label{font-weight:800}
+@media(max-width:767px){.languageToggle{width:100%;justify-content:space-between}.loginLanguageBar{flex-direction:column;align-items:stretch;margin:0 0 16px;padding:12px}.publicHero nav .languageToggle{width:auto}.topbar .topActions .languageToggle{align-self:stretch}}
+
+/* v1.1.6 — cleaned mobile-first login layout */
+.loginLanding{display:flex;align-items:center;justify-content:center;padding:24px;min-height:100vh;background:radial-gradient(circle at 14% 10%,#fff2bd 0,#f8fafc 34%,#e8eefc 100%)}
+.loginShell{width:min(1180px,100%);display:flex;flex-direction:column;gap:18px}
+.loginLayout{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(360px,.72fr);gap:24px;align-items:stretch}
+.loginHero{max-width:none;padding:34px;border-radius:30px;background:rgba(255,255,255,.62);border:1px solid rgba(255,255,255,.82);box-shadow:0 24px 70px rgba(15,23,42,.08);backdrop-filter:blur(14px);display:flex;flex-direction:column;justify-content:center}
+.cleanLoginCard{max-width:none;padding:26px;border-radius:30px;box-shadow:0 28px 70px rgba(15,23,42,.14);align-self:stretch;display:flex;flex-direction:column;justify-content:center}
+.loginHeader{margin-bottom:18px;text-align:left}
+.loginHeader span{display:inline-flex;background:#fff7ed;color:#8b1e24;border:1px solid #fed7aa;border-radius:999px;padding:7px 11px;font-size:.78rem;font-weight:900;text-transform:uppercase;letter-spacing:.04em}
+.loginHeader h2{margin:12px 0 6px;color:var(--blue);font-size:1.5rem;line-height:1.2;letter-spacing:-.02em}
+.loginHeader p{margin:0;color:var(--muted);line-height:1.5;font-weight:700;font-size:.92rem}
+.loginTabs{grid-template-columns:repeat(3,minmax(0,1fr));background:#f8fafc;border:1px solid var(--border);padding:6px;border-radius:16px;gap:6px}
+.loginTabs button{border-radius:12px;min-height:44px;white-space:normal;text-align:center;line-height:1.2;padding:10px 8px}
+.cleanLoginCard form{gap:13px}.cleanLoginCard input{min-height:46px;font-size:1rem}.loginActions{display:grid;grid-template-columns:1fr 1fr;gap:10px}.loginActions button{width:100%;min-height:46px}.credentials{background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:11px 12px;line-height:1.5}.loginLanguageBar{margin:0;max-width:none}.loginLanguageBar .languageToggle{flex:none}
+html[lang="kn"] .loginHeader h2{font-size:1.34rem;line-height:1.35}html[lang="kn"] .loginHero h1{font-size:clamp(1.75rem,3.5vw,3.6rem)}html[lang="kn"] .loginTabs button{font-size:.86rem}
+@media(max-width:1023px){.loginLanding{align-items:flex-start}.loginLayout{grid-template-columns:1fr}.loginHero{order:2;padding:24px}.cleanLoginCard{order:1}.loginHero .brandSeal.big{width:72px;height:72px;border-radius:22px;margin-bottom:12px}.loginHero h1{font-size:clamp(1.65rem,6vw,2.6rem)}}
+@media(max-width:767px){.loginLanding{padding:12px;align-items:stretch}.loginShell{gap:12px}.loginLanguageBar{border-radius:18px;padding:10px 12px}.loginLanguageBar strong{font-size:.86rem}.loginLanguageBar span{font-size:.75rem;line-height:1.45}.loginLanguageBar .languageToggle{width:100%;margin-top:4px}.loginLayout{gap:12px}.cleanLoginCard{border-radius:22px;padding:16px;box-shadow:0 18px 45px rgba(15,23,42,.12)}.loginHeader{text-align:center;margin-bottom:14px}.loginHeader span{font-size:.7rem}.loginHeader h2{font-size:1.18rem;margin:10px 0 5px}.loginHeader p{font-size:.82rem}.loginTabs{grid-template-columns:1fr;gap:7px}.loginTabs button{width:100%;min-height:42px;font-size:.88rem}.loginActions{grid-template-columns:1fr}.loginHero{border-radius:22px;padding:18px;text-align:center}.loginHero .brandSeal.big{margin-left:auto;margin-right:auto;width:62px;height:62px;border-radius:20px;font-size:.92rem}.loginHero p{font-size:.92rem;line-height:1.55}.schemePills{justify-content:center}.schemePills span{font-size:.72rem;padding:7px 9px}.publicLink{width:100%;text-align:center}.credentials{font-size:.78rem;text-align:center}html[lang="kn"] .loginHeader h2{font-size:1.08rem}html[lang="kn"] .loginTabs button{font-size:.84rem}}
+@media(max-width:380px){.loginLanding{padding:8px}.cleanLoginCard{padding:13px}.loginLanguageBar{padding:9px}.loginHeader h2{font-size:1.05rem}.cleanLoginCard input{min-height:44px}.loginHero{padding:14px}.loginHero h1{font-size:1.35rem}}
+
+/* v1.2.0 — all dashboard/statistic tiles are interactive */
+.metricButton{width:100%;display:block;text-align:left;background:var(--card);color:var(--text);appearance:none}
+.metricButton:hover,.clickableTile:hover,.barRowButton:hover,.clickableStatusHero button:hover{transform:translateY(-2px);box-shadow:0 20px 42px rgba(15,23,42,.12);filter:none}
+.metricButton:focus,.clickableTile:focus,.barRowButton:focus,.clickableStatusHero button:focus{outline:3px solid rgba(242,201,76,.55);outline-offset:2px}
+.tileHint{display:inline-block;margin-top:10px;color:var(--red);font-style:normal;font-weight:900;font-size:.78rem}
+.clickableTile{cursor:pointer;transition:transform .16s ease,box-shadow .16s ease}
+.barRowButton{width:100%;background:transparent;color:var(--text);border:0;border-radius:10px;padding:5px;appearance:none;text-align:left}
+.barRowButton span{color:var(--text)}
+.barRowButton em{color:var(--muted)}
+.barRowButton:hover{background:#f8fafc}
+.clickableStatusHero button{background:linear-gradient(135deg,#eff6ff,#fff7ed);color:var(--text);border:1px solid #dbeafe;border-radius:18px;padding:14px;display:block;text-align:left;width:100%;transition:transform .16s ease,box-shadow .16s ease}
+.clickableStatusHero span{display:block;color:var(--muted);font-weight:800;font-size:.8rem}
+.clickableStatusHero strong{display:block;color:var(--blue);font-size:1.15rem;margin-top:5px}
+.reportActions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}

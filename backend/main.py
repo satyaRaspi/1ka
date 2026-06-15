@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse, Response, FileResponse
+from fastapi.responses import StreamingResponse, Response, FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -14,19 +14,83 @@ import csv
 import io
 import zipfile
 import html
+import hmac
+import time
+import threading
 
 APP_NAME = "Karnataka Guarantee Schemes Registration Portal"
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "guarantee_portal.db"))
 OTP_DEMO = os.getenv("DEMO_OTP", "123456")
 
-app = FastAPI(title=APP_NAME, version="1.1.2")
+app = FastAPI(title=APP_NAME, version="1.2.3")
+
+# Security-conscious CORS defaults. For Railway/single-domain deployments the frontend is
+# served by FastAPI and same-origin requests do not need wildcard CORS. Use CORS_ORIGINS
+# only for local development or controlled external domains.
+_cors_env = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000")
+_cors_origins = [origin.strip() for origin in _cors_env.split(",") if origin.strip()]
+_allow_all_cors = "*" in _cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"] if _allow_all_cors else _cors_origins,
+    allow_credentials=False if _allow_all_cors else True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
 )
+
+MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "1") == "1"
+_RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def _rate_limit_key(request: Request, bucket: str) -> str:
+    return f"{bucket}:{_client_ip(request)}"
+
+def _check_rate_limit(key: str, max_hits: int, window_seconds: int) -> bool:
+    now = time.time()
+    hits = [ts for ts in _RATE_LIMIT_BUCKETS.get(key, []) if now - ts < window_seconds]
+    if len(hits) >= max_hits:
+        _RATE_LIMIT_BUCKETS[key] = hits
+        return False
+    hits.append(now)
+    _RATE_LIMIT_BUCKETS[key] = hits
+    return True
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+        return JSONResponse({"detail": "Request body too large"}, status_code=413)
+
+    if RATE_LIMIT_ENABLED:
+        path = request.url.path
+        if path == "/api/auth/admin/login" or path == "/api/auth/callcenter/login":
+            if not _check_rate_limit(_rate_limit_key(request, path), 8, 300):
+                return JSONResponse({"detail": "Too many login attempts. Please try again later."}, status_code=429)
+        elif path == "/api/auth/citizen/otp/request":
+            if not _check_rate_limit(_rate_limit_key(request, path), 5, 60):
+                return JSONResponse({"detail": "Too many OTP requests. Please try again later."}, status_code=429)
+        elif path == "/api/auth/citizen/otp/verify":
+            if not _check_rate_limit(_rate_limit_key(request, path), 10, 60):
+                return JSONResponse({"detail": "Too many OTP verification attempts. Please try again later."}, status_code=429)
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    if request.url.path.startswith("/api"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    if os.getenv("ENABLE_HSTS", "0") == "1":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 SCHEMES = ["Gruha Jyothi", "Gruha Lakshmi", "Anna Bhagya", "Yuva Nidhi", "Shakti Scheme"]
 STATUSES = ["Draft", "Registered", "Under Review", "Returned for Correction", "Approved", "Rejected", "On Hold"]
@@ -54,9 +118,23 @@ PRIVACY_NOTICE = {
 # DB helpers
 # -----------------------------
 
+_DEMO_DATA_LOCK = threading.Lock()
+
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    # SQLite allows only one writer at a time. The timeout + WAL + busy_timeout
+    # settings make local Windows/Mac demos much more tolerant of admin actions
+    # such as mass uploads, reports, and demo-data generation happening close together.
+    conn = sqlite3.connect(DB_PATH, timeout=float(os.getenv("SQLITE_TIMEOUT_SECONDS", "30")))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+    except sqlite3.OperationalError:
+        # If another connection is initializing the DB, the busy timeout above will
+        # cover normal operations; do not fail app startup because a PRAGMA raced.
+        pass
     return conn
 
 
@@ -64,9 +142,31 @@ def now_iso():
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+def _password_salt() -> str:
+    return os.getenv("PASSWORD_SALT", "prototype-salt-change-me")
+
+def legacy_hash_password(password: str) -> str:
+    return hashlib.sha256((_password_salt() + password).encode("utf-8")).hexdigest()
+
 def hash_password(password: str) -> str:
-    salt = os.getenv("PASSWORD_SALT", "prototype-salt-change-me")
-    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    iterations = int(os.getenv("PASSWORD_ITERATIONS", "210000"))
+    salt = _password_salt()
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations).hex()
+    return f"pbkdf2_sha256${iterations}${salt}${digest}"
+
+def verify_password(stored_hash: str, password: str) -> bool:
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        try:
+            _, iterations, salt, digest = stored_hash.split("$", 3)
+            candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iterations)).hex()
+            return hmac.compare_digest(candidate, digest)
+        except Exception:
+            return False
+    # Backward compatible with older prototype databases; successful logins are upgraded.
+    return hmac.compare_digest(stored_hash, legacy_hash_password(password))
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def row_to_dict(row):
@@ -88,15 +188,30 @@ def mask_bank(value: Optional[str]) -> str:
     v = str(value)
     return "X" * max(0, len(v) - 4) + v[-4:]
 
+def mask_mobile(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if len(digits) < 4:
+        return "XXXXXX"
+    return "XXXXXX" + digits[-4:]
+
 
 def generate_application_no() -> str:
     return "KGS" + datetime.utcnow().strftime("%Y%m%d") + secrets.token_hex(3).upper()
 
 
+def _redact_metadata(metadata: Optional[dict]) -> dict:
+    redacted = dict(metadata or {})
+    for key in list(redacted.keys()):
+        if any(term in key.lower() for term in ["aadhaar", "account", "password", "token"]):
+            redacted[key] = "[REDACTED]"
+    return redacted
+
 def audit(conn, user_id: Optional[int], role: str, action: str, record_type: str = "", record_id: str = "", metadata: Optional[dict] = None):
     conn.execute(
         "INSERT INTO audit_logs(user_id, role, action, record_type, record_id, metadata, created_at) VALUES(?,?,?,?,?,?,?)",
-        (user_id, role, action, record_type, str(record_id or ""), json.dumps(metadata or {}), now_iso()),
+        (user_id, role, action, record_type, str(record_id or ""), json.dumps(_redact_metadata(metadata)), now_iso()),
     )
 
 
@@ -311,6 +426,52 @@ def init_db():
             reason TEXT,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS electricity_usage(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            consumer_no TEXT NOT NULL,
+            usage_month TEXT NOT NULL,
+            units REAL NOT NULL,
+            source TEXT DEFAULT 'manual',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(consumer_no, usage_month)
+        );
+        CREATE TABLE IF NOT EXISTS ration_cards(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ration_card_no TEXT UNIQUE NOT NULL,
+            card_type TEXT NOT NULL,
+            household_size INTEGER DEFAULT 0,
+            source TEXT DEFAULT 'manual',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS approval_proposals(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_no TEXT UNIQUE NOT NULL,
+            status TEXT DEFAULT 'Proposed',
+            analytics_json TEXT DEFAULT '{}',
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            applied_by TEXT DEFAULT '',
+            applied_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS approval_proposal_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id INTEGER NOT NULL,
+            application_id INTEGER NOT NULL,
+            scheme_selection_id INTEGER NOT NULL,
+            application_no TEXT NOT NULL,
+            applicant_name TEXT DEFAULT '',
+            scheme_name TEXT NOT NULL,
+            proposed_eligibility_status TEXT NOT NULL,
+            proposed_approval_status TEXT NOT NULL,
+            rule_code TEXT DEFAULT '',
+            reason TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(proposal_id) REFERENCES approval_proposals(id),
+            FOREIGN KEY(application_id) REFERENCES applications(id),
+            FOREIGN KEY(scheme_selection_id) REFERENCES scheme_selections(id)
+        );
         """
     )
     migrate_schema(conn)
@@ -337,6 +498,8 @@ def migrate_schema(conn):
         conn.execute("ALTER TABLE scheme_selections ADD COLUMN eligibility_reason TEXT DEFAULT ''")
     if not column_exists(conn, "scheme_selections", "approved_at"):
         conn.execute("ALTER TABLE scheme_selections ADD COLUMN approved_at TEXT")
+    if not column_exists(conn, "applications", "demo_batch_id"):
+        conn.execute("ALTER TABLE applications ADD COLUMN demo_batch_id TEXT DEFAULT ''")
     # Convert earlier prototype state to the revised business terminology.
     conn.execute("UPDATE applications SET status='Registered', aadhaar_verification_status='Pending Batch Verification' WHERE status='Submitted'")
 
@@ -420,6 +583,26 @@ def seed_data(conn):
                 "INSERT INTO status_history(application_id,previous_status,new_status,changed_by,changed_at,remarks) VALUES(?,?,?,?,?,?)",
                 (app_id, None, status, "seed", created, "Seed sample status"),
             )
+    # reference data samples for approval proposal scan
+    latest_month = datetime.utcnow().strftime("%Y-%m")
+    for row in conn.execute("SELECT electricity_consumer_no FROM addresses WHERE electricity_consumer_no != ''").fetchall():
+        consumer_no = row["electricity_consumer_no"]
+        if not conn.execute("SELECT id FROM electricity_usage WHERE consumer_no=? AND usage_month=?", (consumer_no, latest_month)).fetchone():
+            try:
+                units_seed = 120 + (int(''.join(ch for ch in consumer_no if ch.isdigit()) or '0') % 120)
+            except Exception:
+                units_seed = 150
+            conn.execute("INSERT INTO electricity_usage(consumer_no,usage_month,units,source,created_at,updated_at) VALUES(?,?,?,?,?,?)", (consumer_no, latest_month, units_seed, "seed", now_iso(), now_iso()))
+    for row in conn.execute("SELECT ration_card FROM applications WHERE ration_card != ''").fetchall():
+        card_no = row["ration_card"]
+        if not conn.execute("SELECT id FROM ration_cards WHERE ration_card_no=?", (card_no,)).fetchone():
+            try:
+                num = int(''.join(ch for ch in card_no if ch.isdigit()) or '0')
+            except Exception:
+                num = 0
+            card_type = "BPL" if num % 3 != 0 else "APL"
+            conn.execute("INSERT INTO ration_cards(ration_card_no,card_type,household_size,source,created_at,updated_at) VALUES(?,?,?,?,?,?)", (card_no, card_type, 4, "seed", now_iso(), now_iso()))
+
     # retention / field registry samples
     for category, period in [("Draft applications", "90 days"), ("Approved applications", "As per scheme record policy"), ("Audit logs", "7 years"), ("Consent records", "As per statutory requirement")]:
         if not conn.execute("SELECT id FROM retention_policy WHERE data_category=?", (category,)).fetchone():
@@ -436,7 +619,7 @@ def on_startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": APP_NAME, "version": "1.1.2"}
+    return {"status": "ok", "app": APP_NAME, "version": "1.2.3", "security": "hardened"}
 
 # -----------------------------
 # Models
@@ -534,28 +717,65 @@ class GrievanceCreate(BaseModel):
     category: str
     description: str
 
+class ElectricityUsageCreate(BaseModel):
+    consumer_no: str
+    usage_month: str
+    units: float
+    source: str = "manual"
+
+class RationCardCreate(BaseModel):
+    ration_card_no: str
+    card_type: str
+    household_size: int = 0
+    source: str = "manual"
+
+class MassUploadPayload(BaseModel):
+    csv_text: str = ""
+    rows: List[Dict[str, Any]] = []
+
+class DemoDataRequest(BaseModel):
+    count: int = 100
+    clear_existing_demo: bool = False
+    include_reference_data: bool = True
+
 # -----------------------------
 # Auth
 # -----------------------------
 
 def create_session(conn, user_id: Optional[int], role: str, mobile: Optional[str] = None):
-    token = secrets.token_urlsafe(32)
+    token = secrets.token_urlsafe(48)
+    token_hash = hash_token(token)
     created = now_iso()
-    expires = (datetime.utcnow() + timedelta(hours=12)).replace(microsecond=0).isoformat() + "Z"
-    conn.execute("INSERT INTO sessions(token,user_id,role,mobile,created_at,expires_at) VALUES(?,?,?,?,?,?)", (token, user_id, role, mobile, created, expires))
+    ttl_hours = int(os.getenv("SESSION_TTL_HOURS", "8"))
+    expires = (datetime.utcnow() + timedelta(hours=ttl_hours)).replace(microsecond=0).isoformat() + "Z"
+    conn.execute("INSERT INTO sessions(token,user_id,role,mobile,created_at,expires_at) VALUES(?,?,?,?,?,?)", (token_hash, user_id, role, mobile, created, expires))
     return {"token": token, "role": role, "mobile": mobile, "expires_at": expires}
+
+def _parse_utc_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
 
 
 def require_auth(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Missing bearer token")
     token = authorization.split(" ", 1)[1]
+    token_hash = hash_token(token)
     conn = get_conn()
-    sess = conn.execute("SELECT * FROM sessions WHERE token=?", (token,)).fetchone()
+    sess = conn.execute("SELECT * FROM sessions WHERE token=?", (token_hash,)).fetchone()
     if not sess:
         conn.close()
         raise HTTPException(401, "Invalid token")
-    # Simplified expiry check for prototype
+    try:
+        if _parse_utc_iso(sess["expires_at"]) < datetime.utcnow():
+            conn.execute("DELETE FROM sessions WHERE token=?", (token_hash,))
+            conn.commit(); conn.close()
+            raise HTTPException(401, "Session expired")
+    except HTTPException:
+        raise
+    except Exception:
+        conn.execute("DELETE FROM sessions WHERE token=?", (token_hash,))
+        conn.commit(); conn.close()
+        raise HTTPException(401, "Invalid session")
     user = None
     if sess["user_id"]:
         user = conn.execute("SELECT * FROM users WHERE id=?", (sess["user_id"],)).fetchone()
@@ -583,9 +803,11 @@ def callcenter_login(payload: LoginRequest):
 def password_login(payload: LoginRequest, required_role: str):
     conn = get_conn()
     user = conn.execute("SELECT * FROM users WHERE username=? AND role=? AND active=1", (payload.username, required_role)).fetchone()
-    if not user or user["password_hash"] != hash_password(payload.password):
+    if not user or not verify_password(user["password_hash"], payload.password):
         conn.close()
         raise HTTPException(401, "Invalid username or password")
+    if not user["password_hash"].startswith("pbkdf2_sha256$"):
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(payload.password), user["id"]))
     session = create_session(conn, user["id"], required_role)
     audit(conn, user["id"], required_role, "login", "user", str(user["id"]))
     conn.commit(); conn.close()
@@ -612,7 +834,7 @@ def verify_otp(payload: OTPVerify):
 @app.post("/api/auth/logout")
 def logout(user=Depends(require_auth)):
     conn = get_conn()
-    conn.execute("DELETE FROM sessions WHERE token=?", (user["token"],))
+    conn.execute("DELETE FROM sessions WHERE token=?", (hash_token(user["token"]),))
     audit(conn, user["user_id"], user["role"], "logout")
     conn.commit(); conn.close()
     return {"message": "Logged out"}
@@ -665,8 +887,8 @@ def public_stats(district: str = "", scheme: str = ""):
     }
 
 
-def suppress_small_counts(rows, threshold=1):
-    # Prototype-friendly threshold. Increase for production.
+def suppress_small_counts(rows, threshold: int = int(os.getenv("PUBLIC_STATS_MIN_CELL_SIZE", "5"))):
+    # Privacy-preserving default. Set PUBLIC_STATS_MIN_CELL_SIZE for your deployment.
     output = []
     for r in rows:
         output.append({"label": r["label"] or "Not specified", "value": r["value"] if r["value"] >= threshold else "Suppressed"})
@@ -964,6 +1186,9 @@ def list_applications(
         d = dict(r)
         d["aadhaar_masked"] = mask_aadhaar(d.get("aadhaar"))
         d["account_number_masked"] = mask_bank(d.get("account_number"))
+        d["mobile_masked"] = mask_mobile(d.get("mobile"))
+        if user["role"] == "callcenter":
+            d["mobile"] = d["mobile_masked"]
         d.pop("aadhaar", None); d.pop("account_number", None)
         schemes = conn.execute("SELECT scheme_name FROM scheme_selections WHERE application_id=?", (d["id"],)).fetchall()
         d["schemes"] = [s["scheme_name"] for s in schemes]
@@ -981,7 +1206,10 @@ def get_application_detail(application_id: int, include_sensitive: int = 0, reas
     if include_sensitive and user["role"] != "admin":
         raise HTTPException(403, "Call center cannot view sensitive data")
     if can_sensitive:
-        conn.execute("INSERT INTO sensitive_access_logs(application_id,user_id,role,field_type,reason,created_at) VALUES(?,?,?,?,?,?)", (application_id, user["user_id"], user["role"], "aadhaar_bank", reason or "Admin detail view", now_iso()))
+        if not reason.strip():
+            conn.close()
+            raise HTTPException(400, "Reason is required to view sensitive data")
+        conn.execute("INSERT INTO sensitive_access_logs(application_id,user_id,role,field_type,reason,created_at) VALUES(?,?,?,?,?,?)", (application_id, user["user_id"], user["role"], "aadhaar_bank", reason[:250], now_iso()))
         audit(conn, user["user_id"], user["role"], "sensitive_data_view", "application", application_id, {"reason": reason})
         conn.commit()
     appd = serialize_application(conn, row, include_sensitive=can_sensitive)
@@ -994,14 +1222,412 @@ def add_comment(application_id: int, payload: CommentCreate, user=Depends(requir
     exists = conn.execute("SELECT id FROM applications WHERE id=?", (application_id,)).fetchone()
     if not exists:
         raise HTTPException(404, "Application not found")
-    cur = conn.execute("INSERT INTO comments(application_id,comment_text,created_by,created_role,created_at) VALUES(?,?,?,?,?)", (application_id, payload.comment_text, user["username"], user["role"], now_iso()))
+    comment_text = payload.comment_text.strip()[:2000]
+    if not comment_text:
+        conn.close()
+        raise HTTPException(400, "Comment cannot be blank")
+    cur = conn.execute("INSERT INTO comments(application_id,comment_text,created_by,created_role,created_at) VALUES(?,?,?,?,?)", (application_id, comment_text, user["username"], user["role"], now_iso()))
     audit(conn, user["user_id"], user["role"], "comment_add", "application", application_id)
     conn.commit(); conn.close()
     return {"message": "Comment added", "id": cur.lastrowid}
 
+
+# -----------------------------
+# Approval proposal scan helpers
+# -----------------------------
+
+def normalize_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def address_key(address_row) -> str:
+    if not address_row:
+        return ""
+    parts = [address_row["house_no"], address_row["street"], address_row["village_city"], address_row["taluk"], address_row["district"], address_row["pincode"]]
+    return "|".join(normalize_text(p) for p in parts if normalize_text(p))
+
+
+def latest_electricity_usage(conn, consumer_no: str):
+    if not consumer_no:
+        return None
+    return conn.execute(
+        "SELECT * FROM electricity_usage WHERE consumer_no=? ORDER BY usage_month DESC, updated_at DESC LIMIT 1",
+        (consumer_no.strip(),),
+    ).fetchone()
+
+
+def ration_card_ref(conn, ration_card_no: str):
+    if not ration_card_no:
+        return None
+    return conn.execute("SELECT * FROM ration_cards WHERE ration_card_no=?", (ration_card_no.strip(),)).fetchone()
+
+
+def is_graduate_text(value: Any) -> bool:
+    text = normalize_text(value)
+    graduate_terms = ["graduate", "graduation", "degree", "b.a", "ba", "bsc", "b.sc", "bcom", "b.com", "btech", "b.tech", "be", "b.e", "bca", "bba", "bachelor", "diploma", "post graduate", "postgraduate", "masters", "m.a", "mcom", "m.com", "msc", "m.sc", "mtech", "m.tech", "mba", "mca"]
+    return any(term in text for term in graduate_terms)
+
+
+def application_has_graduate(app_row, family_rows, details: Dict[str, Any]) -> bool:
+    if is_graduate_text(details.get("qualification")) or is_graduate_text(details.get("degree")) or is_graduate_text(details.get("reference")):
+        return True
+    if is_graduate_text(app_row["occupation"]):
+        return True
+    return any(is_graduate_text(row["education_status"]) for row in family_rows)
+
+
+def female_candidates_for_application(app_row, family_rows):
+    candidates = []
+    if normalize_text(app_row["gender"]) == "female":
+        candidates.append({"application_id": app_row["id"], "name": app_row["applicant_name"], "age": int(app_row["age"] or 0), "type": "Applicant"})
+    for row in family_rows:
+        if normalize_text(row["gender"]) == "female":
+            candidates.append({"application_id": app_row["id"], "name": row["full_name"], "age": int(row["age"] or 0), "type": row["relationship"] or "Family member"})
+    return candidates
+
+
+def build_gruha_lakshmi_winners(conn):
+    rows = conn.execute("""
+        SELECT a.*, ad.house_no, ad.street, ad.village_city, ad.taluk, ad.district, ad.pincode
+        FROM applications a
+        JOIN scheme_selections ss ON ss.application_id=a.id AND ss.scheme_name='Gruha Lakshmi'
+        LEFT JOIN addresses ad ON ad.application_id=a.id
+        WHERE a.status IN ('Registered','Under Review','Approved','On Hold')
+    """).fetchall()
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        fam = conn.execute("SELECT * FROM family_members WHERE application_id=?", (row["id"],)).fetchall()
+        key = "|".join(normalize_text(row[k]) for k in ["house_no", "street", "village_city", "taluk", "district", "pincode"] if normalize_text(row[k]))
+        candidates = female_candidates_for_application(row, fam)
+        grouped.setdefault(key or f"application:{row['id']}", []).append({"app": row, "candidates": candidates})
+    winners = {}
+    for key, entries in grouped.items():
+        best = None
+        for entry in entries:
+            for candidate in entry["candidates"]:
+                candidate = dict(candidate)
+                candidate["application_id"] = entry["app"]["id"]
+                if best is None or (candidate["age"], -candidate["application_id"]) > (best["age"], -best["application_id"]):
+                    best = candidate
+        if best:
+            winners[key] = best
+    return winners
+
+
+def proposal_item(conn, proposal_id, app_row, scheme_row, eligibility_status, approval_status, rule_code, reason):
+    app_id = app_row["application_id"] if "application_id" in app_row.keys() else app_row["id"]
+    conn.execute(
+        """INSERT INTO approval_proposal_items(proposal_id,application_id,scheme_selection_id,application_no,applicant_name,scheme_name,proposed_eligibility_status,proposed_approval_status,rule_code,reason,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (proposal_id, app_id, scheme_row["id"], app_row["application_no"], app_row["applicant_name"], scheme_row["scheme_name"], eligibility_status, approval_status, rule_code, reason, now_iso()),
+    )
+
+
+def summarize_proposal(conn, proposal_id: int) -> dict:
+    items = [dict(r) for r in conn.execute("SELECT * FROM approval_proposal_items WHERE proposal_id=? ORDER BY scheme_name, proposed_approval_status, application_no", (proposal_id,)).fetchall()]
+    by_scheme = {}
+    by_decision = {}
+    for item in items:
+        by_scheme.setdefault(item["scheme_name"], {"total": 0, "approved": 0, "rejected": 0, "on_hold": 0})
+        by_scheme[item["scheme_name"]]["total"] += 1
+        decision = item["proposed_approval_status"]
+        if decision == "Approved":
+            by_scheme[item["scheme_name"]]["approved"] += 1
+        elif decision == "Rejected":
+            by_scheme[item["scheme_name"]]["rejected"] += 1
+        else:
+            by_scheme[item["scheme_name"]]["on_hold"] += 1
+        by_decision[decision] = by_decision.get(decision, 0) + 1
+    return {"total_items": len(items), "by_scheme": by_scheme, "by_decision": by_decision}
+
+
+def update_overall_status_after_scheme_decisions(conn, application_id: int, username: str, ts: str):
+    app_row = conn.execute("SELECT * FROM applications WHERE id=?", (application_id,)).fetchone()
+    scheme_rows = [dict(r) for r in conn.execute("SELECT approval_status FROM scheme_selections WHERE application_id=?", (application_id,)).fetchall()]
+    decided = scheme_rows and all(r["approval_status"] in ("Approved", "Rejected") for r in scheme_rows)
+    new_status = None
+    if decided and any(r["approval_status"] == "Approved" for r in scheme_rows):
+        new_status = "Approved"
+    elif decided and all(r["approval_status"] == "Rejected" for r in scheme_rows):
+        new_status = "Rejected"
+    elif scheme_rows and any(r["approval_status"] == "On Hold" for r in scheme_rows):
+        new_status = "Under Review"
+    if new_status and app_row and app_row["status"] != new_status:
+        conn.execute("UPDATE applications SET status=?, updated_at=? WHERE id=?", (new_status, ts, application_id))
+        conn.execute("INSERT INTO status_history(application_id,previous_status,new_status,changed_by,changed_at,remarks) VALUES(?,?,?,?,?,?)", (application_id, app_row["status"], new_status, username, ts, "Overall status updated after approval proposal application"))
+
+
+def parse_csv_rows(csv_text: str) -> List[dict]:
+    if not csv_text.strip():
+        return []
+    reader = csv.DictReader(io.StringIO(csv_text.strip()))
+    return [dict(row) for row in reader]
+
+def _safe_demo_count(count: int) -> int:
+    try:
+        value = int(count)
+    except Exception:
+        value = 100
+    return max(25, min(value, 500))
+
+
+def clear_demo_data(conn) -> dict:
+    ids = [r["id"] for r in conn.execute("SELECT id FROM applications WHERE demo_batch_id LIKE 'DEMO-%'").fetchall()]
+    if not ids:
+        conn.execute("DELETE FROM electricity_usage WHERE source='demo'")
+        conn.execute("DELETE FROM ration_cards WHERE source='demo'")
+        return {"applications_deleted": 0, "reference_rows_deleted": 0}
+    placeholders = ",".join("?" for _ in ids)
+    for table in ["approval_proposal_items", "scheme_selections", "family_members", "addresses", "comments", "status_history", "privacy_requests", "grievances", "sensitive_access_logs"]:
+        conn.execute(f"DELETE FROM {table} WHERE application_id IN ({placeholders})", ids)
+    conn.execute(f"DELETE FROM applications WHERE id IN ({placeholders})", ids)
+    ref_e = conn.execute("DELETE FROM electricity_usage WHERE source='demo'").rowcount
+    ref_r = conn.execute("DELETE FROM ration_cards WHERE source='demo'").rowcount
+    return {"applications_deleted": len(ids), "reference_rows_deleted": max(0, ref_e) + max(0, ref_r)}
+
+
+def _dob_from_age(age: int, month: int = 1, day: int = 15) -> str:
+    year = datetime.utcnow().year - int(age)
+    return f"{year:04d}-{max(1, min(month, 12)):02d}-{max(1, min(day, 28)):02d}"
+
+
+def _insert_demo_application(conn, batch_id: str, idx: int, scenario: int, created_by: str, include_reference_data: bool) -> dict:
+    ts = now_iso()
+    female_names = ["Kavitha H", "Savithri G", "Asha B", "Meena R", "Lakshmi P", "Farzana B", "Padma N", "Roopa S", "Geetha M", "Shobha K"]
+    male_names = ["Ramesh H", "Suresh G", "Naveen B", "Kiran R", "Mahesh P", "Imran B", "Prakash N", "Arun S", "Shivappa M", "Girish K"]
+    districts = DISTRICTS
+    district = districts[idx % len(districts)]
+    taluk = district
+    mobile = f"79{idx:08d}"[-10:]
+    aadhaar = f"77{idx:010d}"[-12:]
+    appno = f"DEMO{datetime.utcnow().strftime('%Y%m%d')}{idx:06d}"
+    ration_card = f"DEMORC{idx:06d}"
+    consumer_no = f"DEMOELEC{idx:06d}"
+    month = datetime.utcnow().strftime("%Y-%m")
+    gender = "Female" if scenario in (0, 1, 4, 5, 8, 9) else "Male"
+    name = female_names[idx % len(female_names)] if gender == "Female" else male_names[idx % len(male_names)]
+    age = 62 if scenario == 0 else 31 if scenario == 1 else 24 if scenario in (6, 7) else 42 + (idx % 10)
+    occupation = "Graduate job seeker" if scenario == 6 else "Worker"
+    education = "Graduate" if scenario == 6 else "PUC" if scenario == 7 else "SSLC"
+    status = "Under Review" if scenario in (0,1,2,3,4,5,6,7,8,9) else "Registered"
+    schemes = {
+        0: ["Gruha Lakshmi", "Shakti Scheme"],
+        1: ["Gruha Lakshmi", "Shakti Scheme"],
+        2: ["Gruha Jyothi"],
+        3: ["Gruha Jyothi"],
+        4: ["Anna Bhagya"],
+        5: ["Anna Bhagya"],
+        6: ["Yuva Nidhi"],
+        7: ["Yuva Nidhi"],
+        8: ["Gruha Jyothi", "Anna Bhagya"],
+        9: ["Gruha Lakshmi", "Gruha Jyothi", "Anna Bhagya", "Yuva Nidhi", "Shakti Scheme"],
+    }[scenario]
+    # Pair same-address Gruha Lakshmi cases so proposal scan can select the eldest female.
+    if scenario in (0, 1):
+        group = idx // 2
+        house_no = f"GL-{group}"
+        street = "Same Address Demo Street"
+        pincode = f"560{group % 1000:03d}"
+        village_city = "Demo Layout"
+    else:
+        house_no = f"D-{idx}"
+        street = f"Demo Street {idx % 25}"
+        pincode = f"56{idx % 10000:04d}"[-6:]
+        village_city = district
+    cur = conn.execute(
+        """INSERT INTO applications(application_no,citizen_mobile,applicant_name,gender,dob,age,mobile,alternate_mobile,email,aadhaar,aadhaar_name,
+        aadhaar_linked_mobile,ration_card,voter_id,caste_category,marital_status,occupation,annual_income,bank_holder_name,bank_name,branch_name,ifsc,account_number,status,
+        aadhaar_verification_status,aadhaar_verified_at,consent_accepted,consent_text,submitted_at,created_at,updated_at,demo_batch_id)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (appno, mobile, name, gender, _dob_from_age(age, (idx % 12) + 1, (idx % 27) + 1), age, mobile, "", f"demo{idx}@example.com", aadhaar, name,
+         mobile, ration_card, f"VOTER{idx:06d}", "General", "Married" if age > 25 else "Single", occupation, str(120000 + idx * 1000), name,
+         "State Bank of India", "Demo Branch", "SBIN0001234", f"1234500000{idx:06d}", status,
+         "Verified" if status == "Under Review" else "Pending Batch Verification", ts if status == "Under Review" else None, 1, CONSENT_TEXT, ts, ts, ts, batch_id)
+    )
+    app_id = cur.lastrowid
+    conn.execute(
+        """INSERT INTO addresses(application_id,house_no,street,ward_no,village_city,local_body,taluk,district,state,pincode,landmark,
+        same_as_aadhaar,residence_type,electricity_consumer_no,lpg_ration_shop,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (app_id, house_no, street, str(1 + idx % 198), village_city, "Municipality", taluk, district, "Karnataka", pincode, "Demo landmark",
+         "Yes", "Own" if idx % 3 else "Rented", consumer_no, f"FPS{idx:04d}", ts, ts),
+    )
+    # Add family members to create family composition variety.
+    spouse_gender = "Male" if gender == "Female" else "Female"
+    spouse_edu = "Graduate" if scenario == 6 else "SSLC"
+    conn.execute(
+        """INSERT INTO family_members(application_id,full_name,relationship,gender,dob,age,aadhaar,mobile,occupation,education_status,
+        marital_status,dependent,gov_benefit,scheme_eligibility,remarks,is_minor,guardian_declaration,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (app_id, f"Demo Spouse {idx}", "Spouse", spouse_gender, _dob_from_age(max(22, age-2), 2, 12), max(22, age-2), f"66{idx:010d}"[-12:], "", "Homemaker", spouse_edu,
+         "Married", "Yes", "No", ", ".join(schemes), "Demo generated", 0, 0, ts, ts),
+    )
+    child_age = 12 + (idx % 6)
+    conn.execute(
+        """INSERT INTO family_members(application_id,full_name,relationship,gender,dob,age,aadhaar,mobile,occupation,education_status,
+        marital_status,dependent,gov_benefit,scheme_eligibility,remarks,is_minor,guardian_declaration,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (app_id, f"Demo Child {idx}", "Daughter" if idx % 2 else "Son", "Female" if idx % 2 else "Male", _dob_from_age(child_age, 3, 8), child_age, f"55{idx:010d}"[-12:], "", "Student", "School",
+         "Single", "Yes", "No", "", "Minor demo record", 1, 1, ts, ts),
+    )
+    for scheme in schemes:
+        details = {"demo_case": True, "scenario": scenario}
+        if scheme == "Gruha Jyothi":
+            details.update({"electricity_consumer_no": consumer_no, "monthly_average_consumption": 160 if scenario in (2,9) else 245 if scenario == 3 else "", "relationship_to_meter_holder": "Self"})
+        elif scheme == "Anna Bhagya":
+            details.update({"ration_card_no": ration_card, "ration_card_type": "BPL" if scenario in (4,9) else "APL" if scenario == 5 else "", "fair_price_shop": f"FPS{idx:04d}"})
+        elif scheme == "Yuva Nidhi":
+            details.update({"qualification": "Graduate" if scenario in (6,9) else "PUC", "year_of_passing": "2025", "employment_status": "Unemployed", "institution_name": "Demo College"})
+        elif scheme == "Gruha Lakshmi":
+            details.update({"woman_head_of_household": "Yes" if gender == "Female" else "No", "ration_card_linkage": ration_card})
+        elif scheme == "Shakti Scheme":
+            details.update({"female_resident": "Yes" if gender == "Female" else "No", "government_id_proof": "Aadhaar"})
+        conn.execute(
+            """INSERT INTO scheme_selections(application_id,scheme_name,details_json,eligibility_status,approval_status,eligibility_reason,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (app_id, scheme, json.dumps(details), "Eligibility Under Review", "Pending Scheme Approval", "Demo generated for approval proposal scan", ts, ts),
+        )
+    conn.execute("INSERT INTO status_history(application_id,previous_status,new_status,changed_by,changed_at,remarks) VALUES(?,?,?,?,?,?)", (app_id, None, status, created_by, ts, f"Mass demo data generated in {batch_id}"))
+    if include_reference_data:
+        if scenario == 2:
+            units = 145
+        elif scenario == 3:
+            units = 225
+        elif scenario == 8:
+            units = None
+        else:
+            units = 165 if idx % 2 else 205
+        if units is not None:
+            conn.execute("""INSERT INTO electricity_usage(consumer_no,usage_month,units,source,created_at,updated_at)
+                          VALUES(?,?,?,?,?,?)
+                          ON CONFLICT(consumer_no, usage_month) DO UPDATE SET units=excluded.units, source='demo', updated_at=excluded.updated_at""",
+                         (consumer_no, month, units, "demo", ts, ts))
+        card_type = "BPL" if scenario in (4, 9) else "APL" if scenario == 5 else "BPL" if idx % 2 else "APL"
+        if scenario != 8:
+            conn.execute("""INSERT INTO ration_cards(ration_card_no,card_type,household_size,source,created_at,updated_at)
+                          VALUES(?,?,?,?,?,?)
+                          ON CONFLICT(ration_card_no) DO UPDATE SET card_type=excluded.card_type, household_size=excluded.household_size, source='demo', updated_at=excluded.updated_at""",
+                         (ration_card, card_type, 3, "demo", ts, ts))
+    return {"application_id": app_id, "scenario": scenario, "schemes": schemes, "status": status}
+
+
+def generate_mass_demo_data(conn, count: int, clear_existing_demo: bool, include_reference_data: bool, username: str) -> dict:
+    count = _safe_demo_count(count)
+    cleared = clear_demo_data(conn) if clear_existing_demo else {"applications_deleted": 0, "reference_rows_deleted": 0}
+    batch_id = "DEMO-" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    scenarios = {i: {"applications": 0, "scheme_items": 0} for i in range(10)}
+    by_scheme = {scheme: 0 for scheme in SCHEMES}
+    by_status = {}
+    for i in range(count):
+        scenario = i % 10
+        result = _insert_demo_application(conn, batch_id, i + int(time.time()) % 100000, scenario, username, include_reference_data)
+        scenarios[scenario]["applications"] += 1
+        scenarios[scenario]["scheme_items"] += len(result["schemes"])
+        for scheme in result["schemes"]:
+            by_scheme[scheme] = by_scheme.get(scheme, 0) + 1
+        by_status[result["status"]] = by_status.get(result["status"], 0) + 1
+    analytics = {
+        "batch_id": batch_id,
+        "applications_created": count,
+        "reference_data_created": include_reference_data,
+        "cleared": cleared,
+        "by_scheme": by_scheme,
+        "by_status": by_status,
+        "scenario_coverage": {
+            "0": "Gruha Lakshmi same-address eldest female winner cases",
+            "1": "Gruha Lakshmi same-address younger female duplicate cases",
+            "2": "Gruha Jyothi below 200 units approved cases",
+            "3": "Gruha Jyothi 200+ units rejection cases",
+            "4": "Anna Bhagya BPL approved cases",
+            "5": "Anna Bhagya APL rejected cases",
+            "6": "Yuva Nidhi graduate approved cases",
+            "7": "Yuva Nidhi non-graduate rejected cases",
+            "8": "Missing reference data / on-hold review cases",
+            "9": "Multi-scheme mixed eligibility cases"
+        },
+        "scenario_counts": scenarios,
+    }
+    return analytics
+
 # -----------------------------
 # Admin
 # -----------------------------
+@app.post("/api/admin/demo-data/generate")
+def admin_generate_demo_data(payload: DemoDataRequest, user=Depends(require_role("admin"))):
+    # Mass demo generation is intentionally serialized because SQLite is a
+    # file-based database and only one writer can hold the write lock at a time.
+    # This prevents the Windows/local demo from failing with "database is locked"
+    # when the UI is also polling dashboards or reports.
+    if not _DEMO_DATA_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "Demo data generation is already running. Please wait and try again.")
+    conn = None
+    try:
+        conn = get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        analytics = generate_mass_demo_data(conn, payload.count, payload.clear_existing_demo, payload.include_reference_data, user["username"])
+        audit(conn, user["user_id"], "admin", "mass_demo_data_generate", "demo_data", analytics.get("batch_id", ""), analytics)
+        conn.commit()
+        return {"message": "Mass demo data generated", "analytics": analytics}
+    except sqlite3.OperationalError as exc:
+        if conn:
+            conn.rollback()
+        if "database is locked" in str(exc).lower():
+            raise HTTPException(409, "Database is busy. Please close other admin actions, wait a few seconds, and run demo generation again.")
+        raise
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+        _DEMO_DATA_LOCK.release()
+
+@app.get("/api/admin/demo-data/summary")
+def admin_demo_data_summary(user=Depends(require_role("admin"))):
+    conn = get_conn()
+    summary = conn.execute("""
+        SELECT COALESCE(demo_batch_id,'') AS batch_id, COUNT(*) AS applications, MIN(created_at) AS first_created, MAX(created_at) AS last_created
+        FROM applications
+        WHERE demo_batch_id LIKE 'DEMO-%'
+        GROUP BY demo_batch_id
+        ORDER BY last_created DESC
+        LIMIT 20
+    """).fetchall()
+    total = conn.execute("SELECT COUNT(*) AS c FROM applications WHERE demo_batch_id LIKE 'DEMO-%'").fetchone()["c"]
+    ref_e = conn.execute("SELECT COUNT(*) AS c FROM electricity_usage WHERE source='demo'").fetchone()["c"]
+    ref_r = conn.execute("SELECT COUNT(*) AS c FROM ration_cards WHERE source='demo'").fetchone()["c"]
+    rows = [dict(r) for r in summary]
+    conn.close()
+    return {"total_demo_applications": total, "electricity_reference_rows": ref_e, "ration_reference_rows": ref_r, "batches": rows}
+
+@app.delete("/api/admin/demo-data")
+def admin_clear_demo_data(user=Depends(require_role("admin"))):
+    if not _DEMO_DATA_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "Demo data operation is already running. Please wait and try again.")
+    conn = None
+    try:
+        conn = get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        result = clear_demo_data(conn)
+        audit(conn, user["user_id"], "admin", "mass_demo_data_clear", "demo_data", "", result)
+        conn.commit()
+        return {"message": "Demo data cleared", **result}
+    except sqlite3.OperationalError as exc:
+        if conn:
+            conn.rollback()
+        if "database is locked" in str(exc).lower():
+            raise HTTPException(409, "Database is busy. Please wait a few seconds and try clearing demo data again.")
+        raise
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+        _DEMO_DATA_LOCK.release()
+
 @app.get("/api/admin/dashboard")
 def admin_dashboard(user=Depends(require_role("admin"))):
     conn = get_conn()
@@ -1053,6 +1679,227 @@ def admin_batch_aadhaar_verification(limit: int = 100, user=Depends(require_role
     conn.commit(); conn.close()
     return {"message": "Batch Aadhaar verification completed", "processed_count": len(processed), "applications": processed}
 
+@app.get("/api/admin/reference/electricity-usage")
+def admin_list_electricity_usage(user=Depends(require_role("admin"))):
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM electricity_usage ORDER BY usage_month DESC, consumer_no LIMIT 500").fetchall()]
+    conn.close()
+    return {"rows": rows}
+
+@app.post("/api/admin/reference/electricity-usage")
+def admin_add_electricity_usage(payload: ElectricityUsageCreate, user=Depends(require_role("admin"))):
+    consumer_no = payload.consumer_no.strip()
+    usage_month = payload.usage_month.strip()
+    if not consumer_no or not usage_month:
+        raise HTTPException(400, "consumer_no and usage_month are required")
+    if payload.units < 0:
+        raise HTTPException(400, "units cannot be negative")
+    conn = get_conn(); ts = now_iso()
+    conn.execute("""INSERT INTO electricity_usage(consumer_no,usage_month,units,source,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(consumer_no,usage_month) DO UPDATE SET units=excluded.units, source=excluded.source, updated_at=excluded.updated_at""",
+                 (consumer_no, usage_month, float(payload.units), payload.source or "manual", ts, ts))
+    audit(conn, user["user_id"], "admin", "electricity_usage_upsert", "electricity_usage", consumer_no, {"month": usage_month})
+    conn.commit(); conn.close()
+    return {"message": "Electricity usage saved"}
+
+@app.post("/api/admin/reference/electricity-usage/upload")
+def admin_upload_electricity_usage(payload: MassUploadPayload, user=Depends(require_role("admin"))):
+    rows = payload.rows or parse_csv_rows(payload.csv_text)
+    conn = get_conn(); ts = now_iso(); saved = 0; errors = []
+    for idx, row in enumerate(rows, start=1):
+        try:
+            consumer_no = str(row.get("consumer_no") or row.get("electricity_consumer_no") or row.get("consumer") or "").strip()
+            usage_month = str(row.get("usage_month") or row.get("month") or "").strip()
+            units = float(row.get("units") or row.get("monthly_units") or 0)
+            if not consumer_no or not usage_month:
+                raise ValueError("consumer_no and usage_month are required")
+            conn.execute("""INSERT INTO electricity_usage(consumer_no,usage_month,units,source,created_at,updated_at)
+                            VALUES(?,?,?,?,?,?)
+                            ON CONFLICT(consumer_no,usage_month) DO UPDATE SET units=excluded.units, source='upload', updated_at=excluded.updated_at""",
+                         (consumer_no, usage_month, units, "upload", ts, ts))
+            saved += 1
+        except Exception as exc:
+            errors.append({"row": idx, "error": str(exc)})
+    audit(conn, user["user_id"], "admin", "electricity_usage_mass_upload", "electricity_usage", "", {"saved": saved, "errors": len(errors)})
+    conn.commit(); conn.close()
+    return {"message": "Electricity usage upload processed", "saved": saved, "errors": errors[:25]}
+
+@app.get("/api/admin/reference/ration-cards")
+def admin_list_ration_cards(user=Depends(require_role("admin"))):
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM ration_cards ORDER BY ration_card_no LIMIT 500").fetchall()]
+    conn.close()
+    return {"rows": rows}
+
+@app.post("/api/admin/reference/ration-cards")
+def admin_add_ration_card(payload: RationCardCreate, user=Depends(require_role("admin"))):
+    card_no = payload.ration_card_no.strip()
+    card_type = payload.card_type.strip().upper()
+    if not card_no or card_type not in ("BPL", "APL"):
+        raise HTTPException(400, "ration_card_no and card_type BPL/APL are required")
+    conn = get_conn(); ts = now_iso()
+    conn.execute("""INSERT INTO ration_cards(ration_card_no,card_type,household_size,source,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(ration_card_no) DO UPDATE SET card_type=excluded.card_type, household_size=excluded.household_size, source=excluded.source, updated_at=excluded.updated_at""",
+                 (card_no, card_type, int(payload.household_size or 0), payload.source or "manual", ts, ts))
+    audit(conn, user["user_id"], "admin", "ration_card_upsert", "ration_cards", card_no, {"card_type": card_type})
+    conn.commit(); conn.close()
+    return {"message": "Ration card saved"}
+
+@app.post("/api/admin/reference/ration-cards/upload")
+def admin_upload_ration_cards(payload: MassUploadPayload, user=Depends(require_role("admin"))):
+    rows = payload.rows or parse_csv_rows(payload.csv_text)
+    conn = get_conn(); ts = now_iso(); saved = 0; errors = []
+    for idx, row in enumerate(rows, start=1):
+        try:
+            card_no = str(row.get("ration_card_no") or row.get("ration_card") or row.get("card_no") or "").strip()
+            card_type = str(row.get("card_type") or row.get("type") or "").strip().upper()
+            household_size = int(row.get("household_size") or row.get("members") or 0)
+            if not card_no or card_type not in ("BPL", "APL"):
+                raise ValueError("ration_card_no and card_type BPL/APL are required")
+            conn.execute("""INSERT INTO ration_cards(ration_card_no,card_type,household_size,source,created_at,updated_at)
+                            VALUES(?,?,?,?,?,?)
+                            ON CONFLICT(ration_card_no) DO UPDATE SET card_type=excluded.card_type, household_size=excluded.household_size, source='upload', updated_at=excluded.updated_at""",
+                         (card_no, card_type, household_size, "upload", ts, ts))
+            saved += 1
+        except Exception as exc:
+            errors.append({"row": idx, "error": str(exc)})
+    audit(conn, user["user_id"], "admin", "ration_card_mass_upload", "ration_cards", "", {"saved": saved, "errors": len(errors)})
+    conn.commit(); conn.close()
+    return {"message": "Ration card upload processed", "saved": saved, "errors": errors[:25]}
+
+@app.get("/api/admin/approval-proposals")
+def admin_list_approval_proposals(user=Depends(require_role("admin"))):
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM approval_proposals ORDER BY created_at DESC LIMIT 20").fetchall()]
+    for row in rows:
+        row["analytics"] = json.loads(row.pop("analytics_json") or "{}")
+    conn.close()
+    return {"proposals": rows}
+
+@app.get("/api/admin/approval-proposals/{proposal_id}")
+def admin_get_approval_proposal(proposal_id: int, user=Depends(require_role("admin"))):
+    conn = get_conn()
+    proposal = conn.execute("SELECT * FROM approval_proposals WHERE id=?", (proposal_id,)).fetchone()
+    if not proposal:
+        conn.close(); raise HTTPException(404, "Proposal not found")
+    p = dict(proposal); p["analytics"] = json.loads(p.pop("analytics_json") or "{}")
+    items = [dict(r) for r in conn.execute("SELECT * FROM approval_proposal_items WHERE proposal_id=? ORDER BY scheme_name, proposed_approval_status, application_no", (proposal_id,)).fetchall()]
+    conn.close()
+    return {"proposal": p, "items": items}
+
+@app.post("/api/admin/approval-proposals/run")
+def admin_run_approval_proposal_scan(user=Depends(require_role("admin"))):
+    conn = get_conn(); ts = now_iso()
+    proposal_no = "APS" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    cur = conn.execute("INSERT INTO approval_proposals(proposal_no,status,analytics_json,created_by,created_at) VALUES(?,?,?,?,?)", (proposal_no, "Proposed", "{}", user["username"], ts))
+    proposal_id = cur.lastrowid
+    gl_winners = build_gruha_lakshmi_winners(conn)
+    scheme_rows = conn.execute("""
+        SELECT ss.*, a.*, ss.id AS scheme_selection_id, ad.electricity_consumer_no, ad.house_no, ad.street, ad.village_city, ad.taluk, ad.district, ad.pincode
+        FROM scheme_selections ss
+        JOIN applications a ON a.id=ss.application_id
+        LEFT JOIN addresses ad ON ad.application_id=a.id
+        WHERE a.status IN ('Registered','Under Review','On Hold','Approved')
+          AND ss.approval_status IN ('Pending Scheme Approval','On Hold','Pending','')
+        ORDER BY a.id, ss.scheme_name
+    """).fetchall()
+    for row in scheme_rows:
+        app_id = row["application_id"]
+        fam = conn.execute("SELECT * FROM family_members WHERE application_id=?", (app_id,)).fetchall()
+        details = {}
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except Exception:
+            details = {}
+        scheme_name = row["scheme_name"]
+        eligibility = "Eligibility Under Review"; approval = "On Hold"; rule_code = "RULE_PENDING"; reason = "No automated rule matched; manual review required."
+        if scheme_name == "Gruha Lakshmi":
+            key = "|".join(normalize_text(row[k]) for k in ["house_no", "street", "village_city", "taluk", "district", "pincode"] if normalize_text(row[k])) or f"application:{app_id}"
+            winner = gl_winners.get(key)
+            females = female_candidates_for_application(row, fam)
+            if not females:
+                eligibility, approval, rule_code = "Not Eligible", "Rejected", "GL_NO_FEMALE"
+                reason = "No female applicant or female immediate family member found for Gruha Lakshmi."
+            elif winner and winner["application_id"] == app_id:
+                eligibility, approval, rule_code = "Eligible", "Approved", "GL_ELDEST_FEMALE_ADDRESS"
+                reason = f"Approved proposal: eldest female identified for same-address family group is {winner['name']} ({winner['age']} years). Only one female is proposed for Gruha Lakshmi at this address."
+            else:
+                eligibility, approval, rule_code = "Not Eligible", "Rejected", "GL_DUPLICATE_ADDRESS_FEMALE"
+                reason = f"Rejected proposal: another eldest female at the same address is proposed for approval ({winner['name'] if winner else 'not available'})."
+        elif scheme_name == "Gruha Jyothi":
+            usage = latest_electricity_usage(conn, row["electricity_consumer_no"])
+            if not row["electricity_consumer_no"]:
+                eligibility, approval, rule_code = "Insufficient Data", "On Hold", "GJ_NO_CONSUMER"
+                reason = "Electricity consumer number is missing."
+            elif not usage:
+                eligibility, approval, rule_code = "Insufficient Data", "On Hold", "GJ_NO_USAGE"
+                reason = f"No monthly electricity usage record found for consumer {row['electricity_consumer_no']}."
+            elif float(usage["units"]) < 200:
+                eligibility, approval, rule_code = "Eligible", "Approved", "GJ_UNDER_200_UNITS"
+                reason = f"Latest usage for {usage['usage_month']} is {usage['units']} units, which is less than 200 units."
+            else:
+                eligibility, approval, rule_code = "Not Eligible", "Rejected", "GJ_200_OR_MORE_UNITS"
+                reason = f"Latest usage for {usage['usage_month']} is {usage['units']} units, which is not less than 200 units."
+        elif scheme_name == "Anna Bhagya":
+            card = ration_card_ref(conn, row["ration_card"])
+            if not row["ration_card"]:
+                eligibility, approval, rule_code = "Insufficient Data", "On Hold", "AB_NO_RATION_CARD"
+                reason = "Ration card number is missing."
+            elif not card:
+                eligibility, approval, rule_code = "Insufficient Data", "On Hold", "AB_CARD_NOT_IN_REFERENCE"
+                reason = f"Ration card {row['ration_card']} is not found in BPL/APL reference table."
+            elif str(card["card_type"]).upper() == "BPL":
+                eligibility, approval, rule_code = "Eligible", "Approved", "AB_BPL_CARD"
+                reason = f"Ration card {row['ration_card']} is marked BPL in the reference table."
+            else:
+                eligibility, approval, rule_code = "Not Eligible", "Rejected", "AB_APL_CARD"
+                reason = f"Ration card {row['ration_card']} is marked APL in the reference table."
+        elif scheme_name == "Yuva Nidhi":
+            if application_has_graduate(row, fam, details):
+                eligibility, approval, rule_code = "Eligible", "Approved", "YN_GRADUATE"
+                reason = "Graduate/diploma qualification found in entered applicant, family or scheme data."
+            else:
+                eligibility, approval, rule_code = "Not Eligible", "Rejected", "YN_NOT_GRADUATE"
+                reason = "No graduate/diploma qualification found in entered data."
+        elif scheme_name == "Shakti Scheme":
+            if normalize_text(row["gender"]) == "female" or any(normalize_text(f["gender"]) == "female" for f in fam):
+                eligibility, approval, rule_code = "Eligible", "Approved", "SS_FEMALE_RESIDENT"
+                reason = "Female Karnataka resident found in application/family details."
+            else:
+                eligibility, approval, rule_code = "Not Eligible", "Rejected", "SS_NO_FEMALE"
+                reason = "No female applicant or family member found for Shakti Scheme."
+        scheme_row_min = {"id": row["scheme_selection_id"], "scheme_name": scheme_name}
+        proposal_item(conn, proposal_id, row, scheme_row_min, eligibility, approval, rule_code, reason)
+    analytics = summarize_proposal(conn, proposal_id)
+    conn.execute("UPDATE approval_proposals SET analytics_json=? WHERE id=?", (json.dumps(analytics), proposal_id))
+    audit(conn, user["user_id"], "admin", "approval_proposal_scan_run", "approval_proposal", proposal_id, analytics)
+    conn.commit(); conn.close()
+    return {"message": "Approval proposal scan completed", "proposal_id": proposal_id, "proposal_no": proposal_no, "analytics": analytics}
+
+@app.post("/api/admin/approval-proposals/{proposal_id}/apply")
+def admin_apply_approval_proposal(proposal_id: int, user=Depends(require_role("admin"))):
+    conn = get_conn(); ts = now_iso()
+    proposal = conn.execute("SELECT * FROM approval_proposals WHERE id=?", (proposal_id,)).fetchone()
+    if not proposal:
+        conn.close(); raise HTTPException(404, "Proposal not found")
+    if proposal["status"] == "Applied":
+        conn.close(); raise HTTPException(400, "Proposal has already been applied")
+    items = conn.execute("SELECT * FROM approval_proposal_items WHERE proposal_id=?", (proposal_id,)).fetchall()
+    affected_apps = set(); applied = 0
+    for item in items:
+        approved_at = ts if item["proposed_approval_status"] == "Approved" else None
+        conn.execute("""UPDATE scheme_selections SET eligibility_status=?, approval_status=?, eligibility_reason=?, approved_at=?, updated_at=? WHERE id=?""",
+                     (item["proposed_eligibility_status"], item["proposed_approval_status"], item["reason"], approved_at, ts, item["scheme_selection_id"]))
+        affected_apps.add(item["application_id"]); applied += 1
+    for application_id in affected_apps:
+        update_overall_status_after_scheme_decisions(conn, application_id, user["username"], ts)
+    conn.execute("UPDATE approval_proposals SET status='Applied', applied_by=?, applied_at=? WHERE id=?", (user["username"], ts, proposal_id))
+    audit(conn, user["user_id"], "admin", "approval_proposal_apply", "approval_proposal", proposal_id, {"items_applied": applied, "applications": len(affected_apps)})
+    conn.commit(); conn.close()
+    return {"message": "Approval proposal applied", "items_applied": applied, "applications_updated": len(affected_apps)}
+
 @app.post("/api/admin/applications/{application_id}/schemes/{scheme_name}/status")
 def admin_update_scheme_status(application_id: int, scheme_name: str, payload: SchemeStatusUpdate, user=Depends(require_role("admin"))):
     if scheme_name not in SCHEMES:
@@ -1090,6 +1937,8 @@ def admin_report(report_name: str, fmt: str = Query("json", regex="^(json|csv|ex
         LEFT JOIN addresses ad ON ad.application_id=a.id
         LEFT JOIN scheme_selections ss ON ss.application_id=a.id
         GROUP BY a.id ORDER BY a.created_at DESC""").fetchall()]
+    for r in rows:
+        r["mobile"] = mask_mobile(r.get("mobile"))
     audit(conn, user["user_id"], "admin", "report_generate", "report", report_name, {"format": fmt})
     conn.commit(); conn.close()
     title = report_name.replace("-", " ").title()
@@ -1116,6 +1965,34 @@ def compliance_dashboard(user=Depends(require_role("admin"))):
     }
     conn.close()
     return {"compliance": data}
+
+
+@app.get("/api/admin/compliance/{detail_name}")
+def compliance_detail(detail_name: str, user=Depends(require_role("admin"))):
+    conn = get_conn()
+    queries = {
+        "consent_records": ("Consent Records", """SELECT application_no, applicant_name, mobile, status, consent_version, submitted_at, updated_at FROM applications WHERE consent_accepted=1 ORDER BY updated_at DESC"""),
+        "pending_privacy_requests": ("Pending Privacy Requests", """SELECT pr.id, a.application_no, a.applicant_name, pr.request_type, pr.description, pr.status, pr.assigned_officer, pr.created_at FROM privacy_requests pr LEFT JOIN applications a ON a.id=pr.application_id WHERE pr.status='Open' ORDER BY pr.created_at DESC"""),
+        "pending_grievances": ("Pending Grievances", """SELECT g.id, a.application_no, a.applicant_name, g.category, g.description, g.status, g.assigned_officer, g.created_at FROM grievances g LEFT JOIN applications a ON a.id=g.application_id WHERE g.status='Open' ORDER BY g.created_at DESC"""),
+        "sensitive_data_views": ("Sensitive Data Views", """SELECT sal.id, a.application_no, u.username, sal.role, sal.field_type, sal.reason, sal.created_at FROM sensitive_access_logs sal LEFT JOIN applications a ON a.id=sal.application_id LEFT JOIN users u ON u.id=sal.user_id ORDER BY sal.created_at DESC"""),
+        "breach_incidents": ("Breach Incidents", """SELECT incident_no, nature, data_categories, citizens_affected, status, mitigation_steps, created_at, closed_at FROM breach_incidents ORDER BY created_at DESC"""),
+        "retention_policies": ("Retention Policies", """SELECT data_category, retention_period, legal_hold, created_at, updated_at FROM retention_policy ORDER BY data_category"""),
+        "data_sharing_records": ("Data Sharing Records", """SELECT receiving_party, purpose, data_fields, legal_basis, frequency, sharing_mode, contact, created_at FROM data_sharing_registry ORDER BY created_at DESC"""),
+    }
+    if detail_name == "public_statistics_last_updated":
+        conn.close()
+        return {"key": detail_name, "title": "Public Statistics Last Updated", "rows": [{"last_updated": now_iso(), "note": "Public statistics are aggregated and do not expose personal citizen data."}]}
+    if detail_name not in queries:
+        conn.close()
+        raise HTTPException(404, "Compliance detail not found")
+    detail_title, sql = queries[detail_name]
+    rows = [dict(r) for r in conn.execute(sql).fetchall()]
+    for r in rows:
+        if "mobile" in r:
+            r["mobile"] = mask_mobile(r.get("mobile"))
+    audit(conn, user["user_id"], "admin", "compliance_detail_view", "compliance", detail_name, {"rows": len(rows)})
+    conn.commit(); conn.close()
+    return {"key": detail_name, "title": detail_title, "rows": rows}
 
 @app.get("/api/admin/audit-logs")
 def audit_logs(limit: int = 100, user=Depends(require_role("admin"))):
@@ -1213,7 +2090,7 @@ if os.path.isdir(FRONTEND_ASSETS):
 def serve_frontend_root():
     if os.path.exists(FRONTEND_INDEX):
         return FileResponse(FRONTEND_INDEX)
-    return {"message": APP_NAME, "version": "1.1.2", "api_docs": "/docs", "health": "/health"}
+    return {"message": APP_NAME, "version": "1.2.3", "api_docs": "/docs", "health": "/health"}
 
 
 @app.get("/{full_path:path}")
@@ -1223,7 +2100,7 @@ def serve_frontend_routes(full_path: str):
         raise HTTPException(status_code=404, detail="Not found")
     if os.path.exists(FRONTEND_INDEX):
         return FileResponse(FRONTEND_INDEX)
-    return {"message": APP_NAME, "version": "1.1.2", "api_docs": "/docs", "health": "/health"}
+    return {"message": APP_NAME, "version": "1.2.3", "api_docs": "/docs", "health": "/health"}
 
 
 if __name__ == "__main__":
