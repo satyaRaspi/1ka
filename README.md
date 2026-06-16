@@ -1,4 +1,4 @@
-# Karnataka Guarantee Schemes Registration Portal v1.2.5
+# Karnataka Guarantee Schemes Registration Portal v1.2.7
 
 A full-stack working prototype for the Government of Karnataka 5 Guarantee Schemes registration portal.
 
@@ -121,7 +121,7 @@ http://localhost:5173
 ```
 
 
-## Workflow added in v1.2.5
+## Workflow added in v1.2.7
 
 1. Citizen completes the form and clicks **Register Application**.
 2. Application status becomes **Registered**.
@@ -131,7 +131,7 @@ http://localhost:5173
 6. Citizen opens **View Status & Eligibility** to see the current application status, Aadhaar batch verification status, and scheme-wise eligibility/approval.
 
 
-## Approval Proposal Scan added in v1.2.5
+## Approval Proposal Scan added in v1.2.7
 
 The admin module includes **Approval Proposal Scan**.
 
@@ -292,7 +292,7 @@ All dashboard/statistic/report tiles are now clickable. Admin dashboard tiles na
 
 See `SECURITY_HARDENING.md` for Railway variables and production hardening notes.
 
-## v1.2.5 Update — Mass Test Demo Data
+## v1.2.7 Update — Mass Test Demo Data
 
 Admin now has a **Demo Data** module for creating mass test data with varied use cases.
 
@@ -320,7 +320,7 @@ API endpoints added:
 - `GET /api/admin/demo-data/summary`
 - `DELETE /api/admin/demo-data`
 
-## v1.2.5 Update — SQLite Demo Data Lock Fix
+## v1.2.7 Update — SQLite Demo Data Lock Fix
 
 This build fixes local Windows/Mac `sqlite3.OperationalError: database is locked` errors that could occur while generating large demo datasets.
 
@@ -332,3 +332,13 @@ Changes:
 - If another demo generation is already running, the API returns a friendly 409 response instead of leaving the database locked.
 
 If a previous run already produced a lock, stop the backend terminal with `Ctrl+C` and restart it before running demo generation again.
+
+
+## v1.2.7 Update — Expired/Invalid Token Handling
+
+- Protected API calls now detect invalid, expired, or missing bearer tokens.
+- Browser session is cleared automatically when the backend rejects an old token.
+- User is returned to the login page with a clear message instead of seeing raw JSON/errors.
+- Fixed duplicate Kannada translation key warning for Public Statistics.
+
+If you see "Invalid token" after changing backend security variables or redeploying, log in again. Old browser tokens are intentionally invalidated after token hashing/salt changes.

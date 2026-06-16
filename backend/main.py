@@ -26,7 +26,7 @@ APP_ENV = os.getenv("APP_ENV", "demo").lower()
 IS_PRODUCTION = APP_ENV in ("prod", "production")
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.5",
+    version="1.2.7",
     docs_url=None if IS_PRODUCTION else "/docs",
     redoc_url=None if IS_PRODUCTION else "/redoc",
     openapi_url=None if IS_PRODUCTION else "/openapi.json",
@@ -711,7 +711,7 @@ def on_startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": APP_NAME, "version": "1.2.5", "security": "hardened"}
+    return {"status": "ok", "app": APP_NAME, "version": "1.2.7", "security": "hardened"}
 
 # -----------------------------
 # Models
@@ -1537,6 +1537,29 @@ def _dob_from_age(age: int, month: int = 1, day: int = 15) -> str:
     return f"{year:04d}-{max(1, min(month, 12)):02d}-{max(1, min(day, 28)):02d}"
 
 
+def _demo_run_suffix(batch_id: str) -> str:
+    """Return a compact, per-run suffix for demo identifiers.
+
+    Earlier builds used the current date plus an index for application_no.
+    When demo data was generated twice quickly without clearing old demo data,
+    the second run could reuse the same application_no and hit SQLite's unique
+    constraint. The batch_id includes microseconds, so deriving identifiers from
+    it makes repeated demo generations collision-safe.
+    """
+    return ''.join(ch for ch in str(batch_id) if ch.isdigit())[-14:]
+
+
+def _unique_demo_identifier(conn, table: str, column: str, prefix: str, suffix: str, idx: int, width: int = 4) -> str:
+    """Build a unique demo identifier and fall forward if a previous run already used it."""
+    base = f"{prefix}{suffix}{idx:0{width}d}"
+    candidate = base
+    attempt = 0
+    while conn.execute(f"SELECT 1 FROM {table} WHERE {column}=? LIMIT 1", (candidate,)).fetchone():
+        attempt += 1
+        candidate = f"{base}-{attempt}"
+    return candidate
+
+
 def _insert_demo_application(conn, batch_id: str, idx: int, scenario: int, created_by: str, include_reference_data: bool) -> dict:
     ts = now_iso()
     female_names = ["Kavitha H", "Savithri G", "Asha B", "Meena R", "Lakshmi P", "Farzana B", "Padma N", "Roopa S", "Geetha M", "Shobha K"]
@@ -1544,11 +1567,12 @@ def _insert_demo_application(conn, batch_id: str, idx: int, scenario: int, creat
     districts = DISTRICTS
     district = districts[idx % len(districts)]
     taluk = district
-    mobile = f"79{idx:08d}"[-10:]
-    aadhaar = f"77{idx:010d}"[-12:]
-    appno = f"DEMO{datetime.utcnow().strftime('%Y%m%d')}{idx:06d}"
-    ration_card = f"DEMORC{idx:06d}"
-    consumer_no = f"DEMOELEC{idx:06d}"
+    run_suffix = _demo_run_suffix(batch_id)
+    mobile = f"79{run_suffix[-4:]}{idx:04d}"[-10:]
+    aadhaar = f"77{run_suffix[-6:]}{idx:04d}"[-12:]
+    appno = _unique_demo_identifier(conn, "applications", "application_no", "DEMO", run_suffix, idx, 4)
+    ration_card = _unique_demo_identifier(conn, "ration_cards", "ration_card_no", "DEMORC", run_suffix, idx, 4)
+    consumer_no = _unique_demo_identifier(conn, "electricity_usage", "consumer_no", "DEMOELEC", run_suffix, idx, 4)
     month = datetime.utcnow().strftime("%Y-%m")
     gender = "Female" if scenario in (0, 1, 4, 5, 8, 9) else "Male"
     name = female_names[idx % len(female_names)] if gender == "Female" else male_names[idx % len(male_names)]
@@ -1660,7 +1684,7 @@ def _insert_demo_application(conn, batch_id: str, idx: int, scenario: int, creat
 def generate_mass_demo_data(conn, count: int, clear_existing_demo: bool, include_reference_data: bool, username: str) -> dict:
     count = _safe_demo_count(count)
     cleared = clear_demo_data(conn) if clear_existing_demo else {"applications_deleted": 0, "reference_rows_deleted": 0}
-    batch_id = "DEMO-" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    batch_id = "DEMO-" + datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
     scenarios = {i: {"applications": 0, "scheme_items": 0} for i in range(10)}
     by_scheme = {scheme: 0 for scheme in SCHEMES}
     by_status = {}
@@ -1715,6 +1739,12 @@ def admin_generate_demo_data(payload: DemoDataRequest, user=Depends(require_role
         audit(conn, user["user_id"], "admin", "mass_demo_data_generate", "demo_data", analytics.get("batch_id", ""), analytics)
         conn.commit()
         return {"message": "Mass demo data generated", "analytics": analytics}
+    except sqlite3.IntegrityError as exc:
+        if conn:
+            conn.rollback()
+        if "unique constraint" in str(exc).lower():
+            raise HTTPException(409, "Demo data identifier collision detected. Please run Generate Demo Data again; the generator now creates a fresh batch identifier for each run.")
+        raise
     except sqlite3.OperationalError as exc:
         if conn:
             conn.rollback()
@@ -2286,7 +2316,7 @@ if os.path.isdir(FRONTEND_ASSETS):
 def serve_frontend_root():
     if os.path.exists(FRONTEND_INDEX):
         return FileResponse(FRONTEND_INDEX)
-    return {"message": APP_NAME, "version": "1.2.3", "api_docs": "/docs", "health": "/health"}
+    return {"message": APP_NAME, "version": "1.2.7", "api_docs": "/docs", "health": "/health"}
 
 
 @app.get("/{full_path:path}")
@@ -2296,7 +2326,7 @@ def serve_frontend_routes(full_path: str):
         raise HTTPException(status_code=404, detail="Not found")
     if os.path.exists(FRONTEND_INDEX):
         return FileResponse(FRONTEND_INDEX)
-    return {"message": APP_NAME, "version": "1.2.3", "api_docs": "/docs", "health": "/health"}
+    return {"message": APP_NAME, "version": "1.2.7", "api_docs": "/docs", "health": "/health"}
 
 
 if __name__ == "__main__":

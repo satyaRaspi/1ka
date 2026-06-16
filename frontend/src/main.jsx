@@ -203,7 +203,6 @@ const I18N = {
     'Compliance': 'ಅನುಪಾಲನೆ',
     'Audit': 'ಆಡಿಟ್',
     'Master': 'ಮಾಸ್ಟರ್',
-    'Public Statistics': 'ಸಾರ್ವಜನಿಕ ಅಂಕಿಅಂಶಗಳು',
     'Generated with masked Aadhaar and bank details by default.': 'ಆಧಾರ್ ಮತ್ತು ಬ್ಯಾಂಕ್ ವಿವರಗಳನ್ನು ಡೀಫಾಲ್ಟ್ ಆಗಿ ಮಾಸ್ಕ್ ಮಾಡಿ ರಚಿಸಲಾಗಿದೆ.',
     'JSON': 'JSON', 'CSV': 'CSV', 'Excel': 'Excel', 'PDF/Text': 'PDF/ಪಠ್ಯ',
     'Correction': 'ತಿದ್ದುಪಡಿ', 'Update': 'ನವೀಕರಣ', 'Grievance': 'ದೂರು', 'Deletion request where legally permitted': 'ಕಾನೂನಿನಂತೆ ಅನುಮತಿಸಿದಲ್ಲಿ ಅಳಿಸುವ ವಿನಂತಿ',
@@ -365,8 +364,10 @@ function validateAddressForm(f) {
 
 function token() { return localStorage.getItem('kgs_token'); }
 function role() { return localStorage.getItem('kgs_role'); }
-function saveSession(data) { localStorage.setItem('kgs_token', data.token); localStorage.setItem('kgs_role', data.role); localStorage.setItem('kgs_user', JSON.stringify(data.user || {})); }
+function saveSession(data) { localStorage.setItem('kgs_token', data.token); localStorage.setItem('kgs_role', data.role); localStorage.setItem('kgs_user', JSON.stringify(data.user || {})); localStorage.removeItem('kgs_auth_notice'); }
 function clearSession() { localStorage.removeItem('kgs_token'); localStorage.removeItem('kgs_role'); localStorage.removeItem('kgs_user'); }
+function isAuthError(status, msg) { return status === 401 || ['Invalid token','Session expired','Missing bearer token','Invalid session'].includes(String(msg || '')); }
+function handleAuthError(msg) { clearSession(); const friendly = msg || 'Session expired. Please login again.'; localStorage.setItem('kgs_auth_notice', friendly); window.dispatchEvent(new CustomEvent('kgs-auth-invalid', { detail: friendly })); }
 
 async function api(path, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
@@ -375,6 +376,7 @@ async function api(path, options = {}) {
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
     try { const err = await res.json(); msg = err.detail || msg; } catch {}
+    if (isAuthError(res.status, msg)) handleAuthError(msg);
     throw new Error(msg);
   }
   const ct = res.headers.get('content-type') || '';
@@ -389,6 +391,7 @@ async function downloadWithAuth(path, fallbackName = 'report') {
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
     try { const err = await res.json(); msg = err.detail || msg; } catch {}
+    if (isAuthError(res.status, msg)) handleAuthError(msg);
     throw new Error(msg);
   }
   const blob = await res.blob();
@@ -408,9 +411,14 @@ async function downloadWithAuth(path, fallbackName = 'report') {
 function App() {
   if (window.location.pathname.startsWith('/public/enrollment-statistics')) return <PublicStats />;
   const [sessionRole, setSessionRole] = useState(role());
-  const [notice, setNotice] = useState('');
+  const [notice, setNotice] = useState(localStorage.getItem('kgs_auth_notice') || '');
+  useEffect(() => {
+    const onInvalid = (e) => { setSessionRole(null); setNotice(e.detail || 'Session expired. Please login again.'); };
+    window.addEventListener('kgs-auth-invalid', onInvalid);
+    return () => window.removeEventListener('kgs-auth-invalid', onInvalid);
+  }, []);
   const logout = async () => { try { await api('/auth/logout', { method: 'POST' }); } catch {} clearSession(); setSessionRole(null); };
-  if (!sessionRole) return <Login onLogin={(data) => { saveSession(data); setSessionRole(data.role); }} />;
+  if (!sessionRole) return <Login notice={notice} setNotice={setNotice} onLogin={(data) => { saveSession(data); setNotice(''); setSessionRole(data.role); }} />;
   return <Shell role={sessionRole} logout={logout} notice={notice} setNotice={setNotice} />;
 }
 
@@ -432,7 +440,7 @@ function Shell({ role, logout, notice, setNotice }) {
   </>;
 }
 
-function Login({ onLogin }) {
+function Login({ onLogin, notice, setNotice }) {
   const { t, tv } = useI18n();
   const [tab, setTab] = useState('citizen');
   const [mobile, setMobile] = useState('9876543210');
@@ -459,6 +467,7 @@ function Login({ onLogin }) {
   }
   useEffect(() => { if (tab === 'admin') { setUsername('admin'); setPassword('admin123'); } if (tab === 'callcenter') { setUsername('callcenter'); setPassword('call123'); } }, [tab]);
   return <div className="landing loginLanding">
+    {notice && <div className="toast loginToast" onClick={() => { setNotice(''); localStorage.removeItem('kgs_auth_notice'); }}>{notice}</div>}
     <div className="loginShell">
       <div className="loginLanguageBar">
         <div>
