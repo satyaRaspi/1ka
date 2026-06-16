@@ -171,6 +171,21 @@ const I18N = {
     'Dashboard': 'ಡ್ಯಾಶ್‌ಬೋರ್ಡ್',
     'Applications': 'ಅರ್ಜಿಗಳು',
     'Approval Scan': 'ಅನುಮೋದನೆ ಸ್ಕ್ಯಾನ್',
+    'Algorithm Config': 'ಅಲ್ಗಾರಿಥಮ್ ಸಂರಚನೆ',
+    'Approval Algorithm Configuration': 'ಅನುಮೋದನೆ ಅಲ್ಗಾರಿಥಮ್ ಸಂರಚನೆ',
+    'Decision Point': 'ನಿರ್ಧಾರ ಬಿಂದು',
+    'Field Key': 'ಕ್ಷೇತ್ರ ಕೀ',
+    'Operator': 'ಆಪರೇಟರ್',
+    'Comparison Value': 'ಹೋಲಿಕೆ ಮೌಲ್ಯ',
+    'Pass Decision': 'ಪಾಸ್ ನಿರ್ಧಾರ',
+    'Fail Decision': 'ಫೇಲ್ ನಿರ್ಧಾರ',
+    'Missing Data Decision': 'ಡೇಟಾ ಇಲ್ಲದಿದ್ದಾಗ ನಿರ್ಧಾರ',
+    'Active': 'ಸಕ್ರಿಯ',
+    'Priority': 'ಆದ್ಯತೆ',
+    'Save Rule': 'ನಿಯಮ ಉಳಿಸಿ',
+    'Reset Defaults': 'ಡೀಫಾಲ್ಟ್ ಮರುಸ್ಥಾಪಿಸಿ',
+    'Configure every approval decision point before running proposal scan.': 'ಪ್ರಸ್ತಾವ ಸ್ಕ್ಯಾನ್ ನಡೆಸುವ ಮೊದಲು ಪ್ರತಿಯೊಂದು ಅನುಮೋದನೆ ನಿರ್ಧಾರ ಬಿಂದುವನ್ನು ಸಂರಚಿಸಿ.',
+    'Rule Label': 'ನಿಯಮ ಲೇಬಲ್',
     'Approval Proposal Scan': 'ಅನುಮೋದನೆ ಪ್ರಸ್ತಾವ ಸ್ಕ್ಯಾನ್',
     'Run Approval Proposal Scan': 'ಅನುಮೋದನೆ ಪ್ರಸ್ತಾವ ಸ್ಕ್ಯಾನ್ ಚಾಲನೆ ಮಾಡಿ',
     'Apply Proposal': 'ಪ್ರಸ್ತಾವ ಅನ್ವಯಿಸಿ',
@@ -530,13 +545,14 @@ function Admin({ setNotice }) {
   }
   return <main className="appGrid">
     <aside className="sidebar">
-      {['dashboard','applications','demo-data','approval-scan','analytics','reports','compliance','audit','master'].map(v => <button key={v} className={view===v?'active':''} onClick={()=>{ setView(v); if(v==='applications') setAppFilters({}); }}>{t(title(v))}</button>)}
+      {['dashboard','applications','demo-data','approval-scan','algorithm-config','analytics','reports','compliance','audit','master'].map(v => <button key={v} className={view===v?'active':''} onClick={()=>{ setView(v); if(v==='applications') setAppFilters({}); }}>{t(title(v))}</button>)}
     </aside>
     <section className="content">
       {view === 'dashboard' && <AdminDashboard onTileOpen={openAdminTile} />}
       {view === 'applications' && <ApplicationsPanel key={JSON.stringify(appFilters)} mode="admin" setNotice={setNotice} initialFilters={appFilters} />}
       {view === 'demo-data' && <DemoDataPanel setNotice={setNotice} />}
       {view === 'approval-scan' && <ApprovalScan setNotice={setNotice} />}
+      {view === 'algorithm-config' && <ApprovalAlgorithmConfig setNotice={setNotice} />}
       {view === 'analytics' && <AdminDashboard analytics onTileOpen={openAdminTile} />}
       {view === 'reports' && <Reports initialReport={reportFocus} />}
       {view === 'compliance' && <Compliance initialKey={complianceFocus} />}
@@ -809,6 +825,95 @@ function ApprovalScan({ setNotice }) {
     <section className="referenceGrid">
       <div className="formCard"><h3>{t('Monthly Electricity Usage Upload')}</h3><p className="hint">{t('CSV columns')}: consumer_no, usage_month, units</p><textarea value={electricityCsv} onChange={e=>setElectricityCsv(e.target.value)} /><button onClick={uploadElectricity}>{t('Mass Upload Electricity Usage')}</button><div className="tableWrap compact"><table><thead><tr><th>{t('Consumer No')}</th><th>{t('Month')}</th><th>{t('Units')}</th></tr></thead><tbody>{electricityRows.slice(0,8).map(r=><tr key={r.id}><td>{r.consumer_no}</td><td>{r.usage_month}</td><td>{r.units}</td></tr>)}</tbody></table></div></div>
       <div className="formCard"><h3>{t('Ration Card BPL/APL Upload')}</h3><p className="hint">{t('CSV columns')}: ration_card_no, card_type, household_size</p><textarea value={rationCsv} onChange={e=>setRationCsv(e.target.value)} /><button onClick={uploadRation}>{t('Mass Upload Ration Cards')}</button><div className="tableWrap compact"><table><thead><tr><th>{t('Ration Card')}</th><th>{t('Card Type')}</th><th>{t('Household Size')}</th></tr></thead><tbody>{rationRows.slice(0,8).map(r=><tr key={r.id}><td>{r.ration_card_no}</td><td>{r.card_type}</td><td>{r.household_size}</td></tr>)}</tbody></table></div></div>
+    </section>
+  </>;
+}
+
+function ApprovalAlgorithmConfig({ setNotice }) {
+  const { t, tv } = useI18n();
+  const [rules, setRules] = useState([]);
+  const [operators, setOperators] = useState(['==','!=','<','<=','>','>=','contains','contains_any','in','not_in','exists','missing']);
+  const [loading, setLoading] = useState(false);
+  async function load(){
+    const res = await api('/admin/approval-algorithm/rules');
+    setRules(res.rules || []);
+    setOperators(res.operators || operators);
+  }
+  useEffect(()=>{ load().catch(e=>setNotice(e.message)); }, []);
+  function updateRule(idx, field, value){
+    const copy = [...rules];
+    copy[idx] = { ...copy[idx], [field]: value };
+    setRules(copy);
+  }
+  async function saveRule(rule){
+    setLoading(true);
+    try {
+      await api(`/admin/approval-algorithm/rules/${encodeURIComponent(rule.rule_code)}`, { method:'PUT', body: JSON.stringify({
+        scheme_name: rule.scheme_name,
+        rule_label: rule.rule_label || '',
+        decision_point: rule.decision_point || '',
+        field_key: rule.field_key || '',
+        comparison_operator: rule.comparison_operator || '==',
+        comparison_value: rule.comparison_value || '',
+        pass_eligibility_status: rule.pass_eligibility_status || 'Eligible',
+        pass_approval_status: rule.pass_approval_status || 'Approved',
+        fail_eligibility_status: rule.fail_eligibility_status || 'Not Eligible',
+        fail_approval_status: rule.fail_approval_status || 'Rejected',
+        missing_eligibility_status: rule.missing_eligibility_status || 'Insufficient Data',
+        missing_approval_status: rule.missing_approval_status || 'On Hold',
+        active: Number(rule.active) ? 1 : 0,
+        priority: Number(rule.priority) || 100,
+        reason_template: rule.reason_template || '',
+        fail_reason_template: rule.fail_reason_template || '',
+        missing_reason_template: rule.missing_reason_template || ''
+      }) });
+      setNotice(t('Approval algorithm rule updated'));
+      await load();
+    } catch(e){ setNotice(e.message); }
+    finally { setLoading(false); }
+  }
+  async function resetDefaults(){
+    if (!confirm(t('Reset Defaults') + '?')) return;
+    setLoading(true);
+    try { await api('/admin/approval-algorithm/reset-defaults', { method:'POST' }); setNotice(t('Defaults restored')); await load(); }
+    catch(e){ setNotice(e.message); }
+    finally { setLoading(false); }
+  }
+  const eligibilityOptions = ['Eligible','Not Eligible','Insufficient Data','Eligibility Under Review','Correction Required','On Hold'];
+  const approvalOptions = ['Approved','Rejected','On Hold','Pending Scheme Approval'];
+  return <>
+    <h2>{t('Approval Algorithm Configuration')}</h2>
+    <p className="hint">{t('Configure every approval decision point before running proposal scan.')}</p>
+    <section className="formCard actionPanel">
+      <div className="proposalHeader">
+        <div><h3>{t('Rule Engine')}</h3><p>{t('Decision points are configurable using field, comparison operator, comparison value and pass/fail/missing outcomes.')}</p></div>
+        <div className="actions"><button className="secondary" onClick={resetDefaults} disabled={loading}>{t('Reset Defaults')}</button></div>
+      </div>
+    </section>
+    <section className="formCard">
+      <div className="tableWrap"><table><thead><tr><th>{t('Scheme')}</th><th>{t('Rule')}</th><th>{t('Decision Point')}</th><th>{t('Field Key')}</th><th>{t('Operator')}</th><th>{t('Comparison Value')}</th><th>{t('Active')}</th><th>{t('Priority')}</th><th>{t('Action')}</th></tr></thead>
+      <tbody>{rules.map((r, idx)=><tr key={r.rule_code}>
+        <td data-label={t('Scheme')}><select value={r.scheme_name} onChange={e=>updateRule(idx,'scheme_name',e.target.value)}>{SCHEMES.map(x=><option key={x} value={x}>{tv(x)}</option>)}</select></td>
+        <td data-label={t('Rule')}><b>{r.rule_code}</b><input value={r.rule_label || ''} onChange={e=>updateRule(idx,'rule_label',e.target.value)} /></td>
+        <td data-label={t('Decision Point')}><textarea value={r.decision_point || ''} onChange={e=>updateRule(idx,'decision_point',e.target.value)} /></td>
+        <td data-label={t('Field Key')}><input value={r.field_key || ''} onChange={e=>updateRule(idx,'field_key',e.target.value)} /></td>
+        <td data-label={t('Operator')}><select value={r.comparison_operator || '=='} onChange={e=>updateRule(idx,'comparison_operator',e.target.value)}>{operators.map(o=><option key={o} value={o}>{o}</option>)}</select></td>
+        <td data-label={t('Comparison Value')}><input value={r.comparison_value || ''} onChange={e=>updateRule(idx,'comparison_value',e.target.value)} /></td>
+        <td data-label={t('Active')}><input type="checkbox" checked={!!Number(r.active)} onChange={e=>updateRule(idx,'active',e.target.checked ? 1 : 0)} /></td>
+        <td data-label={t('Priority')}><input type="number" value={r.priority || 100} onChange={e=>updateRule(idx,'priority',e.target.value)} /></td>
+        <td data-label={t('Action')}><button onClick={()=>saveRule(r)} disabled={loading}>{t('Save Rule')}</button></td>
+      </tr>)}</tbody></table></div>
+    </section>
+    <section className="formCard">
+      <h3>{t('Decision Outcomes')}</h3>
+      <div className="tableWrap"><table><thead><tr><th>{t('Rule')}</th><th>{t('Pass Decision')}</th><th>{t('Fail Decision')}</th><th>{t('Missing Data Decision')}</th><th>{t('Reason')}</th><th>{t('Action')}</th></tr></thead><tbody>{rules.map((r, idx)=><tr key={`${r.rule_code}-outcomes`}>
+        <td data-label={t('Rule')}><b>{r.rule_code}</b></td>
+        <td data-label={t('Pass Decision')}><select value={r.pass_eligibility_status || 'Eligible'} onChange={e=>updateRule(idx,'pass_eligibility_status',e.target.value)}>{eligibilityOptions.map(x=><option key={x} value={x}>{tv(x)}</option>)}</select><select value={r.pass_approval_status || 'Approved'} onChange={e=>updateRule(idx,'pass_approval_status',e.target.value)}>{approvalOptions.map(x=><option key={x} value={x}>{tv(x)}</option>)}</select></td>
+        <td data-label={t('Fail Decision')}><select value={r.fail_eligibility_status || 'Not Eligible'} onChange={e=>updateRule(idx,'fail_eligibility_status',e.target.value)}>{eligibilityOptions.map(x=><option key={x} value={x}>{tv(x)}</option>)}</select><select value={r.fail_approval_status || 'Rejected'} onChange={e=>updateRule(idx,'fail_approval_status',e.target.value)}>{approvalOptions.map(x=><option key={x} value={x}>{tv(x)}</option>)}</select></td>
+        <td data-label={t('Missing Data Decision')}><select value={r.missing_eligibility_status || 'Insufficient Data'} onChange={e=>updateRule(idx,'missing_eligibility_status',e.target.value)}>{eligibilityOptions.map(x=><option key={x} value={x}>{tv(x)}</option>)}</select><select value={r.missing_approval_status || 'On Hold'} onChange={e=>updateRule(idx,'missing_approval_status',e.target.value)}>{approvalOptions.map(x=><option key={x} value={x}>{tv(x)}</option>)}</select></td>
+        <td data-label={t('Reason')}><textarea value={r.reason_template || ''} onChange={e=>updateRule(idx,'reason_template',e.target.value)} /><textarea value={r.fail_reason_template || ''} onChange={e=>updateRule(idx,'fail_reason_template',e.target.value)} /><textarea value={r.missing_reason_template || ''} onChange={e=>updateRule(idx,'missing_reason_template',e.target.value)} /></td>
+        <td data-label={t('Action')}><button onClick={()=>saveRule(r)} disabled={loading}>{t('Save Rule')}</button></td>
+      </tr>)}</tbody></table></div>
     </section>
   </>;
 }

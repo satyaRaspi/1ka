@@ -26,7 +26,7 @@ APP_ENV = os.getenv("APP_ENV", "demo").lower()
 IS_PRODUCTION = APP_ENV in ("prod", "production")
 app = FastAPI(
     title=APP_NAME,
-    version="1.2.7",
+    version="1.2.8",
     docs_url=None if IS_PRODUCTION else "/docs",
     redoc_url=None if IS_PRODUCTION else "/redoc",
     openapi_url=None if IS_PRODUCTION else "/openapi.json",
@@ -552,6 +552,30 @@ def init_db():
             FOREIGN KEY(application_id) REFERENCES applications(id),
             FOREIGN KEY(scheme_selection_id) REFERENCES scheme_selections(id)
         );
+        CREATE TABLE IF NOT EXISTS approval_algorithm_rules(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scheme_name TEXT NOT NULL,
+            rule_code TEXT UNIQUE NOT NULL,
+            rule_label TEXT NOT NULL,
+            decision_point TEXT DEFAULT '',
+            field_key TEXT DEFAULT '',
+            comparison_operator TEXT DEFAULT '==',
+            comparison_value TEXT DEFAULT '',
+            pass_eligibility_status TEXT DEFAULT 'Eligible',
+            pass_approval_status TEXT DEFAULT 'Approved',
+            fail_eligibility_status TEXT DEFAULT 'Not Eligible',
+            fail_approval_status TEXT DEFAULT 'Rejected',
+            missing_eligibility_status TEXT DEFAULT 'Insufficient Data',
+            missing_approval_status TEXT DEFAULT 'On Hold',
+            active INTEGER DEFAULT 1,
+            priority INTEGER DEFAULT 100,
+            reason_template TEXT DEFAULT '',
+            fail_reason_template TEXT DEFAULT '',
+            missing_reason_template TEXT DEFAULT '',
+            updated_by TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     migrate_schema(conn)
@@ -607,6 +631,165 @@ def scheme_defaults_for_status(status: str):
         "On Hold": ("On Hold", "On Hold", "Application is on hold for administrative review."),
     }
     return mapping.get(status, mapping["Registered"])
+
+
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS approval_algorithm_rules(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scheme_name TEXT NOT NULL,
+            rule_code TEXT UNIQUE NOT NULL,
+            rule_label TEXT NOT NULL,
+            decision_point TEXT DEFAULT '',
+            field_key TEXT DEFAULT '',
+            comparison_operator TEXT DEFAULT '==',
+            comparison_value TEXT DEFAULT '',
+            pass_eligibility_status TEXT DEFAULT 'Eligible',
+            pass_approval_status TEXT DEFAULT 'Approved',
+            fail_eligibility_status TEXT DEFAULT 'Not Eligible',
+            fail_approval_status TEXT DEFAULT 'Rejected',
+            missing_eligibility_status TEXT DEFAULT 'Insufficient Data',
+            missing_approval_status TEXT DEFAULT 'On Hold',
+            active INTEGER DEFAULT 1,
+            priority INTEGER DEFAULT 100,
+            reason_template TEXT DEFAULT '',
+            fail_reason_template TEXT DEFAULT '',
+            missing_reason_template TEXT DEFAULT '',
+            updated_by TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+def default_approval_algorithm_rules() -> List[dict]:
+    return [
+        {
+            "scheme_name": "Gruha Lakshmi",
+            "rule_code": "GL_ELDEST_FEMALE_ADDRESS",
+            "rule_label": "Approve eldest female in same-address group",
+            "decision_point": "Only one female from a same-address family group can be approved; select eldest female.",
+            "field_key": "same_address_female_rank",
+            "comparison_operator": "==",
+            "comparison_value": "eldest",
+            "pass_eligibility_status": "Eligible",
+            "pass_approval_status": "Approved",
+            "fail_eligibility_status": "Not Eligible",
+            "fail_approval_status": "Rejected",
+            "missing_eligibility_status": "Insufficient Data",
+            "missing_approval_status": "On Hold",
+            "priority": 10,
+            "reason_template": "Approved proposal: eldest female identified for same-address family group is {winner_name} ({winner_age} years).",
+            "fail_reason_template": "Rejected proposal: another eldest female at the same address is proposed for approval ({winner_name}).",
+            "missing_reason_template": "No female applicant or female immediate family member found for Gruha Lakshmi.",
+        },
+        {
+            "scheme_name": "Gruha Jyothi",
+            "rule_code": "GJ_USAGE_THRESHOLD",
+            "rule_label": "Monthly electricity usage threshold",
+            "decision_point": "Latest monthly electricity usage must satisfy configured comparison against configured units.",
+            "field_key": "electricity_usage.units",
+            "comparison_operator": "<",
+            "comparison_value": "200",
+            "pass_eligibility_status": "Eligible",
+            "pass_approval_status": "Approved",
+            "fail_eligibility_status": "Not Eligible",
+            "fail_approval_status": "Rejected",
+            "missing_eligibility_status": "Insufficient Data",
+            "missing_approval_status": "On Hold",
+            "priority": 20,
+            "reason_template": "Latest usage for {usage_month} is {actual_value} units, which satisfies {operator} {comparison_value} units.",
+            "fail_reason_template": "Latest usage for {usage_month} is {actual_value} units, which does not satisfy {operator} {comparison_value} units.",
+            "missing_reason_template": "Electricity consumer number or monthly usage record is missing.",
+        },
+        {
+            "scheme_name": "Anna Bhagya",
+            "rule_code": "AB_RATION_CARD_TYPE",
+            "rule_label": "Ration card type eligibility",
+            "decision_point": "Ration card reference table card type must match configured card type.",
+            "field_key": "ration_card.card_type",
+            "comparison_operator": "==",
+            "comparison_value": "BPL",
+            "pass_eligibility_status": "Eligible",
+            "pass_approval_status": "Approved",
+            "fail_eligibility_status": "Not Eligible",
+            "fail_approval_status": "Rejected",
+            "missing_eligibility_status": "Insufficient Data",
+            "missing_approval_status": "On Hold",
+            "priority": 30,
+            "reason_template": "Ration card {ration_card} is marked {actual_value} and matches configured rule {operator} {comparison_value}.",
+            "fail_reason_template": "Ration card {ration_card} is marked {actual_value}, which does not match configured rule {operator} {comparison_value}.",
+            "missing_reason_template": "Ration card number or BPL/APL reference record is missing.",
+        },
+        {
+            "scheme_name": "Yuva Nidhi",
+            "rule_code": "YN_QUALIFICATION",
+            "rule_label": "Graduate / diploma qualification check",
+            "decision_point": "Entered education/qualification text must contain one configured graduate term.",
+            "field_key": "qualification_text",
+            "comparison_operator": "contains_any",
+            "comparison_value": "graduate,diploma,bachelor,degree,btech,b.tech,be,b.e,bsc,b.sc,bcom,b.com,bca,bba,masters,mba,mca,postgraduate,post graduate",
+            "pass_eligibility_status": "Eligible",
+            "pass_approval_status": "Approved",
+            "fail_eligibility_status": "Not Eligible",
+            "fail_approval_status": "Rejected",
+            "missing_eligibility_status": "Insufficient Data",
+            "missing_approval_status": "On Hold",
+            "priority": 40,
+            "reason_template": "Graduate/diploma qualification found in entered data using configured terms.",
+            "fail_reason_template": "No graduate/diploma qualification found using configured terms.",
+            "missing_reason_template": "Qualification data is missing.",
+        },
+        {
+            "scheme_name": "Shakti Scheme",
+            "rule_code": "SS_FEMALE_RESIDENT",
+            "rule_label": "Female Karnataka resident check",
+            "decision_point": "Applicant/family gender pool must satisfy configured gender value.",
+            "field_key": "gender_pool",
+            "comparison_operator": "contains",
+            "comparison_value": "female",
+            "pass_eligibility_status": "Eligible",
+            "pass_approval_status": "Approved",
+            "fail_eligibility_status": "Not Eligible",
+            "fail_approval_status": "Rejected",
+            "missing_eligibility_status": "Insufficient Data",
+            "missing_approval_status": "On Hold",
+            "priority": 50,
+            "reason_template": "Female Karnataka resident found in application/family details.",
+            "fail_reason_template": "No female applicant or family member found for Shakti Scheme.",
+            "missing_reason_template": "Gender details are missing.",
+        },
+    ]
+
+
+def seed_approval_algorithm_rules(conn, overwrite: bool = False):
+    ts = now_iso()
+    for rule in default_approval_algorithm_rules():
+        existing = conn.execute("SELECT id FROM approval_algorithm_rules WHERE rule_code=?", (rule["rule_code"],)).fetchone()
+        values = (
+            rule["scheme_name"], rule["rule_code"], rule["rule_label"], rule["decision_point"], rule["field_key"],
+            rule["comparison_operator"], rule["comparison_value"], rule["pass_eligibility_status"], rule["pass_approval_status"],
+            rule["fail_eligibility_status"], rule["fail_approval_status"], rule["missing_eligibility_status"], rule["missing_approval_status"],
+            int(rule.get("active", 1)), int(rule.get("priority", 100)), rule.get("reason_template", ""), rule.get("fail_reason_template", ""),
+            rule.get("missing_reason_template", ""), "system", ts, ts,
+        )
+        if existing and overwrite:
+            conn.execute("""
+                UPDATE approval_algorithm_rules SET scheme_name=?, rule_label=?, decision_point=?, field_key=?, comparison_operator=?, comparison_value=?,
+                    pass_eligibility_status=?, pass_approval_status=?, fail_eligibility_status=?, fail_approval_status=?, missing_eligibility_status=?, missing_approval_status=?,
+                    active=?, priority=?, reason_template=?, fail_reason_template=?, missing_reason_template=?, updated_by=?, updated_at=? WHERE rule_code=?
+            """, (
+                rule["scheme_name"], rule["rule_label"], rule["decision_point"], rule["field_key"], rule["comparison_operator"], rule["comparison_value"],
+                rule["pass_eligibility_status"], rule["pass_approval_status"], rule["fail_eligibility_status"], rule["fail_approval_status"], rule["missing_eligibility_status"], rule["missing_approval_status"],
+                int(rule.get("active", 1)), int(rule.get("priority", 100)), rule.get("reason_template", ""), rule.get("fail_reason_template", ""), rule.get("missing_reason_template", ""),
+                "system", ts, rule["rule_code"]
+            ))
+        elif not existing:
+            conn.execute("""
+                INSERT INTO approval_algorithm_rules(scheme_name,rule_code,rule_label,decision_point,field_key,comparison_operator,comparison_value,
+                    pass_eligibility_status,pass_approval_status,fail_eligibility_status,fail_approval_status,missing_eligibility_status,missing_approval_status,
+                    active,priority,reason_template,fail_reason_template,missing_reason_template,updated_by,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, values)
 
 
 def seed_data(conn):
@@ -703,6 +886,7 @@ def seed_data(conn):
         if not conn.execute("SELECT id FROM data_field_registry WHERE field_name=?", (field_name,)).fetchone():
             conn.execute("""INSERT INTO data_field_registry(field_name,data_category,purpose,scheme_requirement,mandatory,retention_period,masking_rule,export_allowed,public_reporting_allowed)
                           VALUES(?,?,?,?,?,?,?,?,?)""", (field_name, "Personal Data", purpose, "Multiple", "Yes", "As configured", masking, "Masked only", "No"))
+    seed_approval_algorithm_rules(conn, overwrite=False)
 
 @app.on_event("startup")
 def on_startup():
@@ -711,7 +895,7 @@ def on_startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": APP_NAME, "version": "1.2.7", "security": "hardened"}
+    return {"status": "ok", "app": APP_NAME, "version": "1.2.8", "security": "hardened"}
 
 # -----------------------------
 # Models
@@ -838,6 +1022,25 @@ class ResolutionUpdate(BaseModel):
     status: str = Field(..., max_length=50)
     assigned_officer: str = Field("", max_length=120)
     resolution_remarks: str = Field("", max_length=2000)
+
+class ApprovalAlgorithmRuleUpdate(BaseModel):
+    scheme_name: str = Field(..., max_length=80)
+    rule_label: str = Field(..., max_length=160)
+    decision_point: str = Field("", max_length=240)
+    field_key: str = Field("", max_length=120)
+    comparison_operator: str = Field("==", max_length=30)
+    comparison_value: str = Field("", max_length=500)
+    pass_eligibility_status: str = Field("Eligible", max_length=80)
+    pass_approval_status: str = Field("Approved", max_length=80)
+    fail_eligibility_status: str = Field("Not Eligible", max_length=80)
+    fail_approval_status: str = Field("Rejected", max_length=80)
+    missing_eligibility_status: str = Field("Insufficient Data", max_length=80)
+    missing_approval_status: str = Field("On Hold", max_length=80)
+    active: int = Field(1, ge=0, le=1)
+    priority: int = Field(100, ge=1, le=999)
+    reason_template: str = Field("", max_length=1000)
+    fail_reason_template: str = Field("", max_length=1000)
+    missing_reason_template: str = Field("", max_length=1000)
 
 # -----------------------------
 # Auth
@@ -1948,6 +2151,138 @@ def admin_upload_ration_cards(payload: MassUploadPayload, user=Depends(require_r
     conn.commit(); conn.close()
     return {"message": "Ration card upload processed", "saved": saved, "errors": errors[:25]}
 
+def get_active_algorithm_rules(conn) -> Dict[str, dict]:
+    rows = conn.execute("SELECT * FROM approval_algorithm_rules WHERE active=1 ORDER BY priority ASC, id ASC").fetchall()
+    return {row["rule_code"]: dict(row) for row in rows}
+
+
+def get_rule(conn, rules: Dict[str, dict], rule_code: str) -> Optional[dict]:
+    if rule_code in rules:
+        return rules[rule_code]
+    row = conn.execute("SELECT * FROM approval_algorithm_rules WHERE rule_code=?", (rule_code,)).fetchone()
+    return dict(row) if row and int(row["active"] or 0) == 1 else None
+
+
+def _to_number(value: Any) -> Optional[float]:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def compare_rule_value(actual: Any, operator: str, expected: Any) -> bool:
+    op = (operator or "==").strip().lower()
+    actual_text = normalize_text(actual)
+    expected_text = normalize_text(expected)
+    if op in ("exists", "present"):
+        return actual_text != ""
+    if op in ("missing", "blank"):
+        return actual_text == ""
+    if op in ("<", "<=", ">", ">="):
+        a = _to_number(actual)
+        e = _to_number(expected)
+        if a is None or e is None:
+            return False
+        return {"<": a < e, "<=": a <= e, ">": a > e, ">=": a >= e}[op]
+    if op in ("==", "equals", "="):
+        return actual_text == expected_text
+    if op in ("!=", "not_equals"):
+        return actual_text != expected_text
+    if op == "contains":
+        return expected_text in actual_text if expected_text else False
+    if op == "not_contains":
+        return expected_text not in actual_text if expected_text else True
+    if op == "contains_any":
+        terms = [normalize_text(t) for t in str(expected or "").split(",") if normalize_text(t)]
+        return any(term in actual_text for term in terms)
+    if op in ("in", "one_of"):
+        terms = [normalize_text(t) for t in str(expected or "").split(",") if normalize_text(t)]
+        return actual_text in terms
+    if op == "not_in":
+        terms = [normalize_text(t) for t in str(expected or "").split(",") if normalize_text(t)]
+        return actual_text not in terms
+    return actual_text == expected_text
+
+
+def format_rule_reason(template: str, **kwargs) -> str:
+    try:
+        return (template or "").format(**{k: ("" if v is None else v) for k, v in kwargs.items()})
+    except Exception:
+        return template or ""
+
+
+def rule_decision(rule: dict, passed: bool, actual_value: Any = "", missing: bool = False, **context) -> tuple:
+    if not rule:
+        return "Eligibility Under Review", "On Hold", "RULE_DISABLED", "Automated rule is disabled or not configured; manual review required."
+    ctx = {"actual_value": actual_value, "operator": rule.get("comparison_operator", ""), "comparison_value": rule.get("comparison_value", ""), **context}
+    if missing:
+        reason = format_rule_reason(rule.get("missing_reason_template", ""), **ctx) or "Required data is missing for this configured rule."
+        return rule.get("missing_eligibility_status") or "Insufficient Data", rule.get("missing_approval_status") or "On Hold", rule.get("rule_code") or "RULE_MISSING", reason
+    if passed:
+        reason = format_rule_reason(rule.get("reason_template", ""), **ctx) or "Configured rule condition passed."
+        return rule.get("pass_eligibility_status") or "Eligible", rule.get("pass_approval_status") or "Approved", rule.get("rule_code") or "RULE_PASS", reason
+    reason = format_rule_reason(rule.get("fail_reason_template", ""), **ctx) or "Configured rule condition failed."
+    return rule.get("fail_eligibility_status") or "Not Eligible", rule.get("fail_approval_status") or "Rejected", rule.get("rule_code") or "RULE_FAIL", reason
+
+
+def qualification_text_for_rule(app_row, family_rows, details: Dict[str, Any]) -> str:
+    parts = [details.get("qualification", ""), details.get("degree", ""), details.get("reference", ""), app_row["occupation"] or ""]
+    parts.extend([row["education_status"] or "" for row in family_rows])
+    return " | ".join(str(p) for p in parts if str(p or "").strip())
+
+
+@app.get("/api/admin/approval-algorithm/rules")
+def admin_list_approval_algorithm_rules(user=Depends(require_role("admin"))):
+    conn = get_conn()
+    seed_approval_algorithm_rules(conn, overwrite=False)
+    conn.commit()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM approval_algorithm_rules ORDER BY scheme_name, priority, id").fetchall()]
+    conn.close()
+    return {"rules": rows, "operators": ["==", "!=", "<", "<=", ">", ">=", "contains", "not_contains", "contains_any", "in", "not_in", "exists", "missing"]}
+
+
+@app.put("/api/admin/approval-algorithm/rules/{rule_code}")
+def admin_update_approval_algorithm_rule(rule_code: str, payload: ApprovalAlgorithmRuleUpdate, user=Depends(require_role("admin"))):
+    if payload.scheme_name not in SCHEMES:
+        raise HTTPException(400, "Invalid scheme name")
+    if payload.comparison_operator not in ["==", "!=", "<", "<=", ">", ">=", "contains", "not_contains", "contains_any", "in", "not_in", "exists", "missing"]:
+        raise HTTPException(400, "Invalid comparison operator")
+    if payload.pass_approval_status not in ["Approved", "Rejected", "On Hold", "Pending Scheme Approval"]:
+        raise HTTPException(400, "Invalid pass approval status")
+    if payload.fail_approval_status not in ["Approved", "Rejected", "On Hold", "Pending Scheme Approval"]:
+        raise HTTPException(400, "Invalid fail approval status")
+    if payload.missing_approval_status not in ["Approved", "Rejected", "On Hold", "Pending Scheme Approval"]:
+        raise HTTPException(400, "Invalid missing approval status")
+    conn = get_conn(); ts = now_iso()
+    exists = conn.execute("SELECT id FROM approval_algorithm_rules WHERE rule_code=?", (rule_code,)).fetchone()
+    if not exists:
+        conn.close(); raise HTTPException(404, "Approval algorithm rule not found")
+    conn.execute("""
+        UPDATE approval_algorithm_rules SET scheme_name=?, rule_label=?, decision_point=?, field_key=?, comparison_operator=?, comparison_value=?,
+            pass_eligibility_status=?, pass_approval_status=?, fail_eligibility_status=?, fail_approval_status=?, missing_eligibility_status=?, missing_approval_status=?,
+            active=?, priority=?, reason_template=?, fail_reason_template=?, missing_reason_template=?, updated_by=?, updated_at=? WHERE rule_code=?
+    """, (
+        payload.scheme_name, payload.rule_label.strip(), payload.decision_point.strip(), payload.field_key.strip(), payload.comparison_operator,
+        payload.comparison_value.strip(), payload.pass_eligibility_status, payload.pass_approval_status, payload.fail_eligibility_status,
+        payload.fail_approval_status, payload.missing_eligibility_status, payload.missing_approval_status, int(payload.active), int(payload.priority),
+        payload.reason_template.strip(), payload.fail_reason_template.strip(), payload.missing_reason_template.strip(), user["username"], ts, rule_code
+    ))
+    audit(conn, user["user_id"], "admin", "approval_algorithm_rule_update", "approval_algorithm_rule", rule_code, {"scheme": payload.scheme_name, "operator": payload.comparison_operator, "value": payload.comparison_value, "active": payload.active})
+    conn.commit(); conn.close()
+    return {"message": "Approval algorithm rule updated", "rule_code": rule_code}
+
+
+@app.post("/api/admin/approval-algorithm/reset-defaults")
+def admin_reset_approval_algorithm_defaults(user=Depends(require_role("admin"))):
+    conn = get_conn()
+    seed_approval_algorithm_rules(conn, overwrite=True)
+    audit(conn, user["user_id"], "admin", "approval_algorithm_rules_reset", "approval_algorithm_rule", "defaults")
+    conn.commit(); conn.close()
+    return {"message": "Approval algorithm defaults restored"}
+
+
 @app.get("/api/admin/approval-proposals")
 def admin_list_approval_proposals(user=Depends(require_role("admin"))):
     conn = get_conn()
@@ -1971,6 +2306,8 @@ def admin_get_approval_proposal(proposal_id: int, user=Depends(require_role("adm
 @app.post("/api/admin/approval-proposals/run")
 def admin_run_approval_proposal_scan(user=Depends(require_role("admin"))):
     conn = get_conn(); ts = now_iso()
+    seed_approval_algorithm_rules(conn, overwrite=False)
+    rules = get_active_algorithm_rules(conn)
     proposal_no = "APS" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
     cur = conn.execute("INSERT INTO approval_proposals(proposal_no,status,analytics_json,created_by,created_at) VALUES(?,?,?,?,?)", (proposal_no, "Proposed", "{}", user["username"], ts))
     proposal_id = cur.lastrowid
@@ -1995,63 +2332,61 @@ def admin_run_approval_proposal_scan(user=Depends(require_role("admin"))):
         scheme_name = row["scheme_name"]
         eligibility = "Eligibility Under Review"; approval = "On Hold"; rule_code = "RULE_PENDING"; reason = "No automated rule matched; manual review required."
         if scheme_name == "Gruha Lakshmi":
+            rule = get_rule(conn, rules, "GL_ELDEST_FEMALE_ADDRESS")
             key = "|".join(normalize_text(row[k]) for k in ["house_no", "street", "village_city", "taluk", "district", "pincode"] if normalize_text(row[k])) or f"application:{app_id}"
             winner = gl_winners.get(key)
             females = female_candidates_for_application(row, fam)
-            if not females:
-                eligibility, approval, rule_code = "Not Eligible", "Rejected", "GL_NO_FEMALE"
-                reason = "No female applicant or female immediate family member found for Gruha Lakshmi."
-            elif winner and winner["application_id"] == app_id:
-                eligibility, approval, rule_code = "Eligible", "Approved", "GL_ELDEST_FEMALE_ADDRESS"
-                reason = f"Approved proposal: eldest female identified for same-address family group is {winner['name']} ({winner['age']} years). Only one female is proposed for Gruha Lakshmi at this address."
+            if not rule:
+                eligibility, approval, rule_code, reason = "Eligibility Under Review", "On Hold", "GL_RULE_DISABLED", "Gruha Lakshmi automated algorithm rule is disabled."
+            elif not females:
+                eligibility, approval, rule_code, reason = rule_decision(rule, False, actual_value="no female", missing=True, winner_name="", winner_age="")
             else:
-                eligibility, approval, rule_code = "Not Eligible", "Rejected", "GL_DUPLICATE_ADDRESS_FEMALE"
-                reason = f"Rejected proposal: another eldest female at the same address is proposed for approval ({winner['name'] if winner else 'not available'})."
+                passed = bool(winner and winner["application_id"] == app_id and compare_rule_value("eldest", rule.get("comparison_operator"), rule.get("comparison_value")))
+                eligibility, approval, rule_code, reason = rule_decision(rule, passed, actual_value="eldest" if passed else "not_eldest", winner_name=winner["name"] if winner else "not available", winner_age=winner["age"] if winner else "")
         elif scheme_name == "Gruha Jyothi":
+            rule = get_rule(conn, rules, "GJ_USAGE_THRESHOLD")
             usage = latest_electricity_usage(conn, row["electricity_consumer_no"])
-            if not row["electricity_consumer_no"]:
-                eligibility, approval, rule_code = "Insufficient Data", "On Hold", "GJ_NO_CONSUMER"
-                reason = "Electricity consumer number is missing."
-            elif not usage:
-                eligibility, approval, rule_code = "Insufficient Data", "On Hold", "GJ_NO_USAGE"
-                reason = f"No monthly electricity usage record found for consumer {row['electricity_consumer_no']}."
-            elif float(usage["units"]) < 200:
-                eligibility, approval, rule_code = "Eligible", "Approved", "GJ_UNDER_200_UNITS"
-                reason = f"Latest usage for {usage['usage_month']} is {usage['units']} units, which is less than 200 units."
+            if not rule:
+                eligibility, approval, rule_code, reason = "Eligibility Under Review", "On Hold", "GJ_RULE_DISABLED", "Gruha Jyothi automated algorithm rule is disabled."
+            elif not row["electricity_consumer_no"] or not usage:
+                eligibility, approval, rule_code, reason = rule_decision(rule, False, missing=True, actual_value="", usage_month="")
             else:
-                eligibility, approval, rule_code = "Not Eligible", "Rejected", "GJ_200_OR_MORE_UNITS"
-                reason = f"Latest usage for {usage['usage_month']} is {usage['units']} units, which is not less than 200 units."
+                passed = compare_rule_value(usage["units"], rule.get("comparison_operator"), rule.get("comparison_value"))
+                eligibility, approval, rule_code, reason = rule_decision(rule, passed, actual_value=usage["units"], usage_month=usage["usage_month"])
         elif scheme_name == "Anna Bhagya":
+            rule = get_rule(conn, rules, "AB_RATION_CARD_TYPE")
             card = ration_card_ref(conn, row["ration_card"])
-            if not row["ration_card"]:
-                eligibility, approval, rule_code = "Insufficient Data", "On Hold", "AB_NO_RATION_CARD"
-                reason = "Ration card number is missing."
-            elif not card:
-                eligibility, approval, rule_code = "Insufficient Data", "On Hold", "AB_CARD_NOT_IN_REFERENCE"
-                reason = f"Ration card {row['ration_card']} is not found in BPL/APL reference table."
-            elif str(card["card_type"]).upper() == "BPL":
-                eligibility, approval, rule_code = "Eligible", "Approved", "AB_BPL_CARD"
-                reason = f"Ration card {row['ration_card']} is marked BPL in the reference table."
+            if not rule:
+                eligibility, approval, rule_code, reason = "Eligibility Under Review", "On Hold", "AB_RULE_DISABLED", "Anna Bhagya automated algorithm rule is disabled."
+            elif not row["ration_card"] or not card:
+                eligibility, approval, rule_code, reason = rule_decision(rule, False, missing=True, actual_value="", ration_card=row["ration_card"] or "")
             else:
-                eligibility, approval, rule_code = "Not Eligible", "Rejected", "AB_APL_CARD"
-                reason = f"Ration card {row['ration_card']} is marked APL in the reference table."
+                passed = compare_rule_value(card["card_type"], rule.get("comparison_operator"), rule.get("comparison_value"))
+                eligibility, approval, rule_code, reason = rule_decision(rule, passed, actual_value=card["card_type"], ration_card=row["ration_card"])
         elif scheme_name == "Yuva Nidhi":
-            if application_has_graduate(row, fam, details):
-                eligibility, approval, rule_code = "Eligible", "Approved", "YN_GRADUATE"
-                reason = "Graduate/diploma qualification found in entered applicant, family or scheme data."
+            rule = get_rule(conn, rules, "YN_QUALIFICATION")
+            qtext = qualification_text_for_rule(row, fam, details)
+            if not rule:
+                eligibility, approval, rule_code, reason = "Eligibility Under Review", "On Hold", "YN_RULE_DISABLED", "Yuva Nidhi automated algorithm rule is disabled."
+            elif not qtext.strip():
+                eligibility, approval, rule_code, reason = rule_decision(rule, False, missing=True, actual_value="")
             else:
-                eligibility, approval, rule_code = "Not Eligible", "Rejected", "YN_NOT_GRADUATE"
-                reason = "No graduate/diploma qualification found in entered data."
+                passed = compare_rule_value(qtext, rule.get("comparison_operator"), rule.get("comparison_value"))
+                eligibility, approval, rule_code, reason = rule_decision(rule, passed, actual_value=qtext[:120])
         elif scheme_name == "Shakti Scheme":
-            if normalize_text(row["gender"]) == "female" or any(normalize_text(f["gender"]) == "female" for f in fam):
-                eligibility, approval, rule_code = "Eligible", "Approved", "SS_FEMALE_RESIDENT"
-                reason = "Female Karnataka resident found in application/family details."
+            rule = get_rule(conn, rules, "SS_FEMALE_RESIDENT")
+            gender_pool = ",".join([normalize_text(row["gender"])] + [normalize_text(f["gender"]) for f in fam if normalize_text(f["gender"])])
+            if not rule:
+                eligibility, approval, rule_code, reason = "Eligibility Under Review", "On Hold", "SS_RULE_DISABLED", "Shakti Scheme automated algorithm rule is disabled."
+            elif not gender_pool:
+                eligibility, approval, rule_code, reason = rule_decision(rule, False, missing=True, actual_value="")
             else:
-                eligibility, approval, rule_code = "Not Eligible", "Rejected", "SS_NO_FEMALE"
-                reason = "No female applicant or family member found for Shakti Scheme."
+                passed = compare_rule_value(gender_pool, rule.get("comparison_operator"), rule.get("comparison_value"))
+                eligibility, approval, rule_code, reason = rule_decision(rule, passed, actual_value=gender_pool)
         scheme_row_min = {"id": row["scheme_selection_id"], "scheme_name": scheme_name}
         proposal_item(conn, proposal_id, row, scheme_row_min, eligibility, approval, rule_code, reason)
     analytics = summarize_proposal(conn, proposal_id)
+    analytics["algorithm_rules_used"] = len(rules)
     conn.execute("UPDATE approval_proposals SET analytics_json=? WHERE id=?", (json.dumps(analytics), proposal_id))
     audit(conn, user["user_id"], "admin", "approval_proposal_scan_run", "approval_proposal", proposal_id, analytics)
     conn.commit(); conn.close()
@@ -2316,7 +2651,7 @@ if os.path.isdir(FRONTEND_ASSETS):
 def serve_frontend_root():
     if os.path.exists(FRONTEND_INDEX):
         return FileResponse(FRONTEND_INDEX)
-    return {"message": APP_NAME, "version": "1.2.7", "api_docs": "/docs", "health": "/health"}
+    return {"message": APP_NAME, "version": "1.2.8", "api_docs": "/docs", "health": "/health"}
 
 
 @app.get("/{full_path:path}")
@@ -2326,7 +2661,7 @@ def serve_frontend_routes(full_path: str):
         raise HTTPException(status_code=404, detail="Not found")
     if os.path.exists(FRONTEND_INDEX):
         return FileResponse(FRONTEND_INDEX)
-    return {"message": APP_NAME, "version": "1.2.7", "api_docs": "/docs", "health": "/health"}
+    return {"message": APP_NAME, "version": "1.2.8", "api_docs": "/docs", "health": "/health"}
 
 
 if __name__ == "__main__":

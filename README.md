@@ -1,4 +1,4 @@
-# Karnataka Guarantee Schemes Registration Portal v1.2.7
+# Karnataka Guarantee Schemes Registration Portal v1.2.8
 
 A full-stack working prototype for the Government of Karnataka 5 Guarantee Schemes registration portal.
 
@@ -121,7 +121,7 @@ http://localhost:5173
 ```
 
 
-## Workflow added in v1.2.7
+## Workflow added in v1.2.8
 
 1. Citizen completes the form and clicks **Register Application**.
 2. Application status becomes **Registered**.
@@ -131,7 +131,7 @@ http://localhost:5173
 6. Citizen opens **View Status & Eligibility** to see the current application status, Aadhaar batch verification status, and scheme-wise eligibility/approval.
 
 
-## Approval Proposal Scan added in v1.2.7
+## Approval Proposal Scan added in v1.2.8
 
 The admin module includes **Approval Proposal Scan**.
 
@@ -292,7 +292,7 @@ All dashboard/statistic/report tiles are now clickable. Admin dashboard tiles na
 
 See `SECURITY_HARDENING.md` for Railway variables and production hardening notes.
 
-## v1.2.7 Update — Mass Test Demo Data
+## v1.2.8 Update — Mass Test Demo Data
 
 Admin now has a **Demo Data** module for creating mass test data with varied use cases.
 
@@ -320,7 +320,7 @@ API endpoints added:
 - `GET /api/admin/demo-data/summary`
 - `DELETE /api/admin/demo-data`
 
-## v1.2.7 Update — SQLite Demo Data Lock Fix
+## v1.2.8 Update — SQLite Demo Data Lock Fix
 
 This build fixes local Windows/Mac `sqlite3.OperationalError: database is locked` errors that could occur while generating large demo datasets.
 
@@ -334,7 +334,7 @@ Changes:
 If a previous run already produced a lock, stop the backend terminal with `Ctrl+C` and restart it before running demo generation again.
 
 
-## v1.2.7 Update — Expired/Invalid Token Handling
+## v1.2.8 Update — Expired/Invalid Token Handling
 
 - Protected API calls now detect invalid, expired, or missing bearer tokens.
 - Browser session is cleared automatically when the backend rejects an old token.
@@ -342,3 +342,10 @@ If a previous run already produced a lock, stop the backend terminal with `Ctrl+
 - Fixed duplicate Kannada translation key warning for Public Statistics.
 
 If you see "Invalid token" after changing backend security variables or redeploying, log in again. Old browser tokens are intentionally invalidated after token hashing/salt changes.
+
+
+## v1.2.8 Approval Algorithm Configuration
+
+Admin users now have an **Algorithm Config** page to configure approval-decision points before running the Approval Proposal Scan. Each rule supports an active flag, priority, field key, comparison operator, comparison value, pass/fail/missing-data outcomes, and editable reason templates. Default rules can be restored from the same screen.
+
+Configurable operators include `==`, `!=`, `<`, `<=`, `>`, `>=`, `contains`, `contains_any`, `in`, `not_in`, `exists`, and `missing`.
